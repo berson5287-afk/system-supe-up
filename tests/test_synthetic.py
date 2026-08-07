@@ -260,6 +260,81 @@ def test_incident_capture(tmp: Path) -> None:
         print("  " + line)
 
 
+# ------------------------------------------------------------- wait chains
+
+def test_wait_chains() -> None:
+    """Chains that need SeDebugPrivilege to observe for real.
+
+    Running unelevated, Windows returns every node as "pid only", so the
+    interesting cases — a cross-process COM chain, and a cycle — cannot be
+    produced on this machine at all. They are asserted here instead.
+    """
+    print("\nwait chain traversal (synthetic)")
+    from sysup.telemetry import WaitChain, WaitChainNode
+
+    # Outlook -> COM -> Teams -> mutex -> Teams. The example that motivated
+    # the whole feature.
+    chain = WaitChain(tid=18424, nodes=[
+        WaitChainNode(is_thread=True, object_type=8, status=2,
+                      pid=700, tid=18424, wait_time_ms=12000),
+        WaitChainNode(is_thread=False, object_type=5, status=2),
+        WaitChainNode(is_thread=True, object_type=8, status=2,
+                      pid=900, tid=11984),
+        WaitChainNode(is_thread=False, object_type=3, status=2,
+                      name="TeamsLock"),
+        WaitChainNode(is_thread=True, object_type=8, status=5,
+                      pid=900, tid=14532),
+    ])
+    names = {700: "OUTLOOK.EXE", 900: "Teams.exe"}
+    check("chain is usable", chain.usable)
+    check("crosses into the blocking process", chain.processes() == [900],
+          str(chain.processes()))
+    blocker = chain.blocker()
+    check("names the final blocking thread",
+          blocker is not None and blocker.pid == 900 and blocker.tid == 14532)
+
+    lines = chain.describe(names)
+    joined = " / ".join(lines)
+    check("renders the COM hop", "a COM call" in joined, joined[:100])
+    check("renders the mutex by name", "TeamsLock" in joined)
+    check("names both processes",
+          "OUTLOOK.EXE" in joined and "Teams.exe" in joined)
+    check("shows how long it has waited", "waiting 12s" in joined)
+
+    # A cycle: Windows' own proof of deadlock.
+    cycle = WaitChain(tid=1, is_cycle=True, nodes=[
+        WaitChainNode(is_thread=True, object_type=8, status=2, pid=5, tid=1),
+        WaitChainNode(is_thread=False, object_type=1, status=2),
+        WaitChainNode(is_thread=True, object_type=8, status=2, pid=5, tid=2),
+    ])
+    row = ProcRow(pid=5, name="app.exe", title="App")
+    row.wait_chain = cycle
+    sample = make_sample(processes=[row])
+    sentence = rules._chain_sentence(row, sample)
+    check("a cycle is called a deadlock", "deadlock" in sentence.lower(),
+          sentence[:90])
+    evidence = rules._chain_evidence(row, sample)
+    check("cycle appears in evidence",
+          any("CYCLE" in line for line in evidence))
+
+    # Restricted: the unelevated reality, which must advise rather than lie.
+    restricted = WaitChain(tid=9, restricted=True, nodes=[
+        WaitChainNode(is_thread=True, object_type=8, status=3, pid=5, tid=9)])
+    row2 = ProcRow(pid=6, name="other.exe")
+    row2.wait_chain = restricted
+    evidence = rules._chain_evidence(row2, make_sample(processes=[row2]))
+    check("restricted chain advises elevation",
+          any("administrator" in line for line in evidence),
+          evidence[0][:80] if evidence else "none")
+    check("restricted chain makes no claim about the blocker",
+          rules._chain_sentence(row2, make_sample(processes=[row2])) == "")
+
+    # And a process with no chain at all must add nothing.
+    row3 = ProcRow(pid=7, name="fine.exe")
+    check("no chain adds no evidence",
+          rules._chain_evidence(row3, make_sample(processes=[row3])) == [])
+
+
 def main() -> int:
     import tempfile
 
@@ -268,7 +343,8 @@ def main() -> int:
     print("=" * 74)
     with tempfile.TemporaryDirectory() as folder:
         for test in (test_fake_backend, test_slow_disk,
-                     test_commit_versus_physical, test_stall_without_load):
+                     test_commit_versus_physical, test_stall_without_load,
+                     test_wait_chains):
             try:
                 test()
             except Exception as error:

@@ -124,6 +124,9 @@ WAIT_BUCKETS: dict[str, dict] = {
 #: because they are how an idle *server* waits — see the "ipc" bucket.
 BENIGN_REASONS = {4, 5, 6, 11, 12, 13, 14, 15, 16, 20, 22}
 
+#: The ambiguous wait — see ThreadWaits.alert_waits.
+WR_ALERT_BY_THREAD_ID = 37
+
 #: Windows' own default ceiling per process for GDI and USER objects.
 GUI_OBJECT_LIMIT = 10_000
 
@@ -150,6 +153,17 @@ class ThreadWaits:
     buckets: dict[str, int] = field(default_factory=dict)
     #: the single most significant non-benign bucket, or ""
     dominant: str = ""
+    #: Threads in WrAlertByThreadId (37) — an ambiguous state that is *both*
+    #: how an idle thread pool parks and how a modern critical section or
+    #: SRW lock waits, because both go through WaitOnAddress. It is therefore
+    #: useless as evidence on its own and is never reported as a finding.
+    #:
+    #: It is kept because it makes an excellent trigger: cheap to count, and
+    #: exactly the population worth spending an expensive Wait Chain
+    #: Traversal call on. A real lock deadlock lives here and nowhere else —
+    #: which is why the first deadlock injected into this program was missed
+    #: entirely until this was separated out.
+    alert_waits: int = 0
 
     @property
     def stuck(self) -> int:
@@ -171,6 +185,109 @@ class ThreadWaits:
             self.dominant = max(
                 self.buckets,
                 key=lambda b: (WAIT_BUCKETS[b]["severity"], self.buckets[b]))
+
+
+#: What a thread is blocked *on*, as Windows' Wait Chain Traversal reports it.
+WCT_OBJECT_TYPES = {
+    1: "a critical section", 2: "a SendMessage call", 3: "a mutex",
+    4: "an ALPC call", 5: "a COM call", 6: "another thread",
+    7: "another process", 8: "a thread", 9: "COM activation",
+    10: "something unknown", 11: "a socket", 12: "a network file",
+}
+
+WCT_STATUSES = {
+    0: "no access", 1: "running", 2: "blocked", 3: "pid only",
+    4: "pid only (rpcss)", 5: "owned", 6: "not owned", 7: "abandoned",
+    8: "unknown", 9: "error",
+}
+
+
+@dataclass
+class WaitChainNode:
+    """One link: either a thread, or the thing a thread is waiting on."""
+
+    #: True for a thread node, False for a lock/COM/ALPC object node.
+    is_thread: bool = False
+    object_type: int = 0
+    status: int = 0
+    pid: int = 0
+    tid: int = 0
+    wait_time_ms: int = 0
+    context_switches: int = 0
+    name: str = ""
+
+    @property
+    def type_name(self) -> str:
+        return WCT_OBJECT_TYPES.get(self.object_type, "something unknown")
+
+    @property
+    def status_name(self) -> str:
+        return WCT_STATUSES.get(self.status, "unknown")
+
+    @property
+    def blocked(self) -> bool:
+        return self.status == 2
+
+
+@dataclass
+class WaitChain:
+    """Why a thread is stuck, followed as far as Windows will say.
+
+    This is the difference between "Outlook is waiting on another process" and
+    "Outlook's UI thread is blocked on a COM call into Teams, whose thread is
+    blocked on a mutex held by another Teams thread". The first is a symptom;
+    the second names the culprit.
+    """
+
+    tid: int = 0
+    nodes: list[WaitChainNode] = field(default_factory=list)
+    #: Windows itself telling us the chain loops — a genuine deadlock, not
+    #: merely a long wait. Nothing else in this program can prove that.
+    is_cycle: bool = False
+    error: str = ""
+    #: Windows answered, but would only say which process the thread is in —
+    #: every node came back as "pid only". That is what a wait chain looks
+    #: like without SeDebugPrivilege: the call succeeds and tells you nothing.
+    #: Worth distinguishing from "no chain", because the remedy is running as
+    #: administrator rather than concluding the process is fine.
+    restricted: bool = False
+
+    @property
+    def usable(self) -> bool:
+        return len(self.nodes) > 1 and not self.error
+
+    def processes(self) -> list[int]:
+        """Distinct pids along the chain, in order, excluding the first."""
+        seen: list[int] = []
+        for node in self.nodes:
+            if node.is_thread and node.pid and node.pid not in seen:
+                seen.append(node.pid)
+        return seen[1:]
+
+    def blocker(self) -> WaitChainNode | None:
+        """The last thread in the chain — whoever everyone else is waiting on."""
+        threads = [n for n in self.nodes if n.is_thread]
+        return threads[-1] if len(threads) > 1 else None
+
+    def describe(self, names: dict[int, str] | None = None) -> list[str]:
+        """The chain as readable lines, one per hop."""
+        names = names or {}
+        lines: list[str] = []
+        for node in self.nodes:
+            if node.is_thread:
+                label = names.get(node.pid) or f"pid {node.pid}"
+                detail = f"thread {node.tid} in {label}"
+                if node.status_name not in ("unknown", "running"):
+                    detail += f" ({node.status_name})"
+                if node.wait_time_ms > 1000:
+                    detail += f", waiting {node.wait_time_ms / 1000:.0f}s"
+                lines.append(detail)
+            else:
+                what = node.type_name
+                if node.name:
+                    what += f" “{node.name[:40]}”"
+                lines.append(f"    ↓ blocked on {what}")
+        return lines
 
 
 @dataclass
@@ -197,6 +314,10 @@ class ProcSnapshot:
     read_bytes: int = 0
     write_bytes: int = 0
     waits: ThreadWaits = field(default_factory=ThreadWaits)
+    #: Thread ids of threads in a non-benign wait. Kept so a wait chain can be
+    #: followed later without re-enumerating every thread on the machine —
+    #: these are the only ones worth asking about.
+    blocked_threads: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -261,6 +382,8 @@ class TelemetryBackend(Protocol):
 
     def memory_info(self) -> MemoryInfo: ...
 
+    def wait_chain(self, tid: int) -> WaitChain: ...
+
 
 class FakeBackend:
     """A machine you describe, for testing rules that real hardware will not do.
@@ -319,6 +442,13 @@ class FakeBackend:
         if isinstance(info, MemoryInfo):
             return info
         return MemoryInfo(**info) if info else MemoryInfo()
+
+    def wait_chain(self, tid: int) -> WaitChain:
+        chains = self._current().get("wait_chains") or {}
+        chain = chains.get(tid)
+        if isinstance(chain, WaitChain):
+            return chain
+        return WaitChain(tid=tid, **chain) if chain else WaitChain(tid=tid)
 
 
 def default_backend() -> TelemetryBackend:

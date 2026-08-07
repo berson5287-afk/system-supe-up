@@ -25,7 +25,7 @@ import psutil
 
 # Shapes only — the Windows implementation is reached through the backend,
 # so importing this module does not load ctypes.
-from .telemetry import HungWindow, ProcSnapshot, ThreadWaits
+from .telemetry import HungWindow, ProcSnapshot, ThreadWaits, WaitChain
 
 #: 100ns kernel ticks per second.
 TICKS_PER_SECOND = 10_000_000
@@ -60,6 +60,10 @@ class ProcRow:
     gdi: int = 0
     user_objects: int = 0
     age_s: float = 0.0
+    #: What this process is actually blocked on, followed across process
+    #: boundaries. Only resolved for processes that are hung or blocked, and
+    #: only every few seconds — see `Sampler._attach_wait_chains`.
+    wait_chain: WaitChain | None = None
 
     @property
     def io_bps(self) -> float:
@@ -158,6 +162,11 @@ class Sample:
 CONTINUITY_LIMIT_S = 10.0
 CONTINUITY_MULTIPLE = 6.0
 
+#: Wait chains walk other processes and can block briefly, so they are
+#: resolved rarely and only for processes that are genuinely stuck.
+CHAIN_INTERVAL_S = 4.0
+CHAIN_MAX_PROCESSES = 5
+
 
 class Sampler:
     """Holds the previous snapshot so each sample can be a rate."""
@@ -183,6 +192,8 @@ class Sampler:
         #: worth asking about, and only every few seconds.
         self._gui_cache: dict[int, tuple[int, int]] = {}
         self._gui_checked_at: float = 0.0
+        self._chain_cache: dict[int, WaitChain] = {}
+        self._chain_checked_at: float = 0.0
 
     def reset(self) -> None:
         """Forget the previous sample, so the next one is a fresh baseline.
@@ -365,7 +376,68 @@ class Sampler:
         sample.hard_faults = total_faults
         sample.ready_threads = ready
         self._attach_titles(rows, gui_pids, hung_pids)
+        self._attach_wait_chains(rows, current, hung_pids)
         sample.processes = rows
+
+    def _attach_wait_chains(self, rows: list[ProcRow],
+                            current: dict[int, ProcSnapshot],
+                            hung_pids: set[int]) -> None:
+        """Follow the wait chain for processes that are actually stuck.
+
+        Deliberately narrow and throttled. `GetThreadWaitChain` walks other
+        processes and can itself block for a moment, so running it across 380
+        processes every second would make the monitor part of the problem it
+        is measuring. Only processes Windows says are hung, or that have
+        threads parked on a lock or a cross-process call, are worth asking
+        about — and only every few seconds, because a chain that resolves in
+        under that is not the kind of hang anybody notices.
+        """
+        now = time.monotonic()
+        if (now - self._chain_checked_at) < CHAIN_INTERVAL_S:
+            for row in rows:
+                row.wait_chain = self._chain_cache.get(row.pid)
+            return
+        self._chain_checked_at = now
+
+        wanted: list[ProcRow] = []
+        for row in rows:
+            stuck = row.waits.buckets
+            if row.pid in hung_pids or stuck.get("lock") or stuck.get("ipc"):
+                wanted.append(row)
+            elif row.waits.alert_waits >= 2 and row.cpu < 1.0:
+                # Ambiguous lock-shaped waits, in a process doing no work.
+                # Cheap to spot and worth confirming; a busy process is not
+                # deadlocked no matter what its threads are parked on.
+                wanted.append(row)
+        # Worst first, so the cap falls on the least interesting.
+        wanted.sort(key=lambda r: -(r.waits.buckets.get("lock", 0) * 10
+                                    + r.waits.buckets.get("ipc", 0)
+                                    + r.waits.alert_waits
+                                    + (100 if r.pid in hung_pids else 0)))
+
+        chains: dict[int, WaitChain] = {}
+        for row in wanted[:CHAIN_MAX_PROCESSES]:
+            snapshot = current.get(row.pid)
+            if snapshot is None:
+                continue
+            for tid in snapshot.blocked_threads[:2]:
+                try:
+                    chain = self.backend.wait_chain(tid)
+                except Exception:
+                    continue
+                # A chain of one node is just "this thread is blocked", which
+                # we already knew from the wait reason. A *restricted* chain
+                # is worth keeping even so: it is the difference between "no
+                # information" and "Windows has this and will hand it over to
+                # an administrator", which is advice the user can act on.
+                if chain.usable:
+                    chains[row.pid] = chain
+                    break
+                if chain.restricted and row.pid not in chains:
+                    chains[row.pid] = chain
+        self._chain_cache = chains
+        for row in rows:
+            row.wait_chain = chains.get(row.pid)
 
     def _attach_titles(self, rows: list[ProcRow], gui_pids: set[int],
                        hung_pids: set[int]) -> None:

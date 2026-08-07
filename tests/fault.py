@@ -148,6 +148,56 @@ def threads(seconds: float, count: int) -> None:
     time.sleep(seconds)
 
 
+def deadlock(seconds: float) -> None:
+    """Two threads, two locks, taken in opposite orders. A real deadlock.
+
+    Win32 critical sections deliberately, not Python locks. A `threading.Lock`
+    waits on a kernel event, which the wait-reason tables see as an ordinary
+    UserRequest wait and Wait Chain Traversal cannot follow to an owner.
+    Critical sections record their owning thread, which is precisely what WCT
+    walks — and what lets Windows report the chain as a *cycle* rather than
+    merely a long wait.
+
+    ctypes releases the GIL around foreign calls, so these threads really do
+    block in the operating system rather than politely in the interpreter.
+    """
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # RTL_CRITICAL_SECTION is 40 bytes on x64; over-allocate rather than
+    # depend on that.
+    first = ctypes.create_string_buffer(64)
+    second = ctypes.create_string_buffer(64)
+    for section in (first, second):
+        kernel32.InitializeCriticalSection(ctypes.byref(section))
+
+    ready = threading.Barrier(3, timeout=10)
+
+    def hold(outer, inner) -> None:
+        kernel32.EnterCriticalSection(ctypes.byref(outer))
+        try:
+            ready.wait()                  # both threads hold one lock each
+            time.sleep(0.3)
+            kernel32.EnterCriticalSection(ctypes.byref(inner))   # blocks here
+            kernel32.LeaveCriticalSection(ctypes.byref(inner))
+        except Exception:
+            pass
+        finally:
+            try:
+                kernel32.LeaveCriticalSection(ctypes.byref(outer))
+            except Exception:
+                pass
+
+    threading.Thread(target=hold, args=(first, second), daemon=True).start()
+    threading.Thread(target=hold, args=(second, first), daemon=True).start()
+    try:
+        ready.wait()
+    except threading.BrokenBarrierError:
+        pass
+    print(f"deadlock: two threads locked against each other, pid {os.getpid()}",
+          flush=True)
+    # The threads never return; the process exits when this does.
+    time.sleep(seconds)
+
+
 def io(seconds: float) -> None:
     """Write and re-read a file continuously, bypassing the cache on read."""
     end = _deadline(seconds)
@@ -174,7 +224,7 @@ def io(seconds: float) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Misbehave on purpose.")
     parser.add_argument("mode", choices=("cpu", "hang", "memory", "handles",
-                                         "threads", "io"))
+                                         "threads", "io", "deadlock"))
     parser.add_argument("seconds", type=float, nargs="?", default=30.0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--mb", type=int, default=700)
@@ -192,6 +242,8 @@ def main() -> int:
         handles(seconds, max(1, min(args.count, 200_000)))
     elif args.mode == "threads":
         threads(seconds, max(1, min(args.count, 2000)))
+    elif args.mode == "deadlock":
+        deadlock(seconds)
     elif args.mode == "io":
         io(seconds)
     return 0

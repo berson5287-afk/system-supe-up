@@ -114,6 +114,47 @@ def _name_of(row: ProcRow) -> str:
     return f"{display}, pid {row.pid}"
 
 
+def _chain_evidence(row: ProcRow, sample: Sample) -> list[str]:
+    """The wait chain as evidence lines, or a note about why there is none."""
+    chain = getattr(row, "wait_chain", None)
+    if chain is None:
+        return []
+    if chain.restricted:
+        return ["Windows knows what this is blocked on but will only reveal "
+                "it to an administrator — run System Supe-Up elevated to see "
+                "the chain"]
+    if not chain.usable:
+        return []
+    names = {r.pid: r.name for r in sample.processes}
+    lines = ["what it is actually waiting on:"]
+    lines += ["  " + line for line in chain.describe(names)]
+    if chain.is_cycle:
+        lines.append("Windows reports this chain as a CYCLE — a true deadlock")
+    return lines
+
+
+def _chain_sentence(row: ProcRow, sample: Sample) -> str:
+    """One sentence naming the blocker, for use inside an explanation."""
+    chain = getattr(row, "wait_chain", None)
+    if chain is None or not chain.usable:
+        return ""
+    blocker = chain.blocker()
+    if blocker is None:
+        return ""
+    names = {r.pid: r.name for r in sample.processes}
+    who = names.get(blocker.pid) or f"pid {blocker.pid}"
+    if chain.is_cycle:
+        return (f" Windows has followed the chain and reports it as a cycle: "
+                f"the threads are waiting on each other, which is a true "
+                f"deadlock rather than a slow operation.")
+    if blocker.pid and blocker.pid != row.pid:
+        return (f" Following the chain, it is ultimately blocked on thread "
+                f"{blocker.tid} in {who} — that is the process to look at, "
+                f"not this one.")
+    return (f" Following the chain, it is blocked on thread {blocker.tid} "
+            f"inside itself, so the fault is internal to this application.")
+
+
 def _growth(history: History, pid: int, attribute: str) -> float:
     """How much a field grew across the history window, in raw units."""
     values = []
@@ -241,6 +282,8 @@ def _rule_hung_apps(history: History, sample: Sample) -> list[Finding]:
         if row.waits.stuck:
             evidence.append("thread waits: " + row.waits.describe())
         evidence += [f"window: “{t[:70]}”" for t in titles[:4]]
+        evidence += _chain_evidence(row, sample)
+        why += _chain_sentence(row, sample)
 
         findings.append(Finding(
             id=f"hung:{window_pid}",
@@ -873,13 +916,19 @@ def _rule_blocked_on_other_process(history: History,
         if knowledge.is_essential(row.name) and stuck < row.waits.total / 2:
             continue    # csrss always has a few; only care when it is most
 
-        blockers = [sample.find(p) for p in hung_pids]
-        blockers = [b for b in blockers if b is not None]
-        pointer = ""
-        if blockers:
-            pointer = (f" The likeliest thing it is waiting for is "
-                       f"{_name_of(blockers[0])}, which is itself not "
-                       f"responding.")
+        # Prefer the measured chain over the guess. Windows can say exactly
+        # which thread in which process is holding things up; picking
+        # "whatever else is hung" was only ever a plausible-sounding
+        # substitute for asking.
+        pointer = _chain_sentence(row, sample)
+        if not pointer:
+            blockers = [sample.find(p) for p in hung_pids]
+            blockers = [b for b in blockers if b is not None]
+            if blockers:
+                pointer = (f" The likeliest thing it is waiting for is "
+                           f"{_name_of(blockers[0])}, which is itself not "
+                           f"responding — though that is an inference from "
+                           f"what else is stuck, not a followed chain.")
 
         fact = knowledge.lookup(row.name)
         findings.append(Finding(
@@ -896,7 +945,8 @@ def _rule_blocked_on_other_process(history: History,
                 f"what needs attention."),
             evidence=[f"{stuck} of {row.waits.total} threads in cross-process "
                       f"waits", f"persistent across {persistent}/15 samples",
-                      f"CPU {history.sustained(row.pid, 'cpu', 15):.1f}%"],
+                      f"CPU {history.sustained(row.pid, 'cpu', 15):.1f}%"]
+                     + _chain_evidence(row, sample),
             fixes=list(fact.fixes[:2]) if fact else [],
             pid=row.pid, process=row.name))
     return findings[:3]

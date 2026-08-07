@@ -108,7 +108,57 @@ def html_to_text(html: str) -> str:
 
 def domain_of(url: str) -> str:
     match = re.match(r"https?://([^/]+)", url or "", re.IGNORECASE)
-    return match.group(1).lower() if match else (url or "")[:40]
+    host = match.group(1).lower() if match else (url or "")[:40]
+    return host.split("@")[-1].split(":")[0]     # strip creds and port
+
+
+def host_matches(host: str, domain: str) -> bool:
+    """Is `host` actually `domain`, or a subdomain of it?
+
+    Substring matching is the obvious implementation and it is wrong in a way
+    that matters: "microsoft.com" is a substring of both
+    "evil-microsoft.com" and "microsoft.com.attacker.net", so a page
+    controlled by anybody could be ranked as trusted documentation and read
+    in full ahead of the real thing. Only an exact match or a genuine
+    dot-delimited suffix counts.
+    """
+    host = (host or "").lower().rstrip(".")
+    domain = (domain or "").lower().rstrip(".")
+    return bool(domain) and (host == domain or host.endswith("." + domain))
+
+
+def _is_internal(host: str) -> bool:
+    """Would fetching this reach something on the local network?
+
+    Search results are attacker-influenceable — anyone can rank a page — and
+    this program runs on a machine with an Ollama server, a SearXNG instance
+    and whatever else is on the LAN. Following a result that points at
+    127.0.0.1, a private range, or the cloud metadata address would turn the
+    research step into a request forgery primitive aimed at the user's own
+    network. Note this deliberately does not apply to the configured SearXNG
+    address itself, which is *supposed* to be private.
+    """
+    import ipaddress
+    import socket
+
+    host = (host or "").strip().strip("[]")
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, OSError):
+        return True             # cannot resolve it — do not fetch it
+    for info in infos:
+        address = info[4][0]
+        try:
+            parsed = ipaddress.ip_address(address.split("%")[0])
+        except ValueError:
+            return True
+        if (parsed.is_private or parsed.is_loopback or parsed.is_link_local
+                or parsed.is_reserved or parsed.is_multicast
+                or parsed.is_unspecified):
+            return True
+    return False
 
 
 @dataclass
@@ -211,7 +261,14 @@ class Researcher:
         sources = []
         for item in payload.get("results", []):
             url = item.get("url", "")
-            if not url or any(junk in url.lower() for junk in JUNK_DOMAINS):
+            if not url:
+                continue
+            host = domain_of(url)
+            # Junk stays a substring match against the whole URL: these are
+            # blocked, so over-matching is the safe direction to fail.
+            if any(junk in url.lower() for junk in JUNK_DOMAINS):
+                continue
+            if _is_internal(host):
                 continue
             sources.append(Source(
                 title=(item.get("title") or url)[:200],
@@ -220,8 +277,10 @@ class Researcher:
 
         # Trusted sources first, so that when only the top two get read in
         # full it is the documentation that gets read and not the blog.
+        # Proper hostname matching, not substring — otherwise
+        # "microsoft.com.attacker.net" is promoted to the top of the list.
         sources.sort(key=lambda s: 0 if any(
-            t in s.domain for t in TRUSTED_DOMAINS) else 1)
+            host_matches(s.domain, t) for t in TRUSTED_DOMAINS) else 1)
         return sources[:max_results]
 
     @staticmethod
@@ -240,10 +299,32 @@ class Researcher:
         return stem in haystack
 
     def fetch(self, url: str) -> str:
+        """Read one search result, refusing anything that points inward."""
+        if not url.lower().startswith(("http://", "https://")):
+            return ""
+        if _is_internal(domain_of(url)):
+            return ""
         try:
+            # Redirects are followed manually so each hop can be checked —
+            # otherwise a public URL can 302 straight to 127.0.0.1 and the
+            # guard above never sees it.
             response = requests.get(
-                url, timeout=self.timeout, allow_redirects=True,
+                url, timeout=self.timeout, allow_redirects=False,
                 headers={"User-Agent": USER_AGENT})
+            hops = 0
+            while response.is_redirect and hops < 4:
+                target = response.headers.get("Location", "")
+                if not target:
+                    return ""
+                target = requests.compat.urljoin(url, target)
+                if (not target.lower().startswith(("http://", "https://"))
+                        or _is_internal(domain_of(target))):
+                    return ""
+                url = target
+                hops += 1
+                response = requests.get(
+                    url, timeout=self.timeout, allow_redirects=False,
+                    headers={"User-Agent": USER_AGENT})
             if response.status_code >= 400:
                 return ""
             if "html" not in response.headers.get("Content-Type", ""):

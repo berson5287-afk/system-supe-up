@@ -33,30 +33,65 @@ RUN_KEYS = (
      r"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run"),
 )
 
-#: System-log events that actually explain a freeze or a hard lock-up, rather
-#: than the constant background noise of a Windows event log.
-INTERESTING_EVENTS = {
-    41: "The machine lost power or locked up hard — Windows did not shut down "
-        "cleanly. This is logged on the *next* boot, so it describes the "
-        "previous crash.",
-    6008: "Unexpected shutdown.",
-    1001: "Windows Error Reporting recorded a crash (often a bugcheck).",
-    7: "The disk reported a bad block.",
-    51: "An error was detected during a paging operation — the drive failed a "
-        "read or write of the page file. Strongly associated with freezes.",
-    153: "The storage driver retried or abandoned an I/O request.",
-    129: "The storage controller reset a device that stopped responding — a "
-         "classic cause of multi-second whole-system freezes.",
-    157: "A disk was surprise-removed or dropped off the bus.",
-    55: "The file system detected corruption on a volume.",
-    1: "A WHEA hardware error was recorded.",
-    17: "A correctable hardware error was recorded.",
-    18: "An uncorrectable hardware error was recorded.",
-    219: "A driver failed to load.",
-    10110: "A driver reported a problem.",
-    2004: "Windows detected that the machine was running out of memory and "
-          "started trimming applications.",
-}
+#: Events that actually explain a freeze, keyed by **provider and id together**.
+#:
+#: An event id means nothing on its own. Id 1 is emitted by hundreds of
+#: providers; so are 7, 17 and 18. Keying meanings by id alone — which this
+#: did originally — labels an unrelated Event 1 from any random service as
+#: "A WHEA hardware error was recorded", which is exactly the kind of
+#: confident, wrong, hardware-shaped claim that sends someone off to buy
+#: memory they do not need.
+#:
+#: Each entry is (id, provider substrings that must match, meaning). Provider
+#: matching is case-insensitive and substring-based against the source name,
+#: which is how Windows abbreviates these in the classic event log.
+EVENT_MEANINGS: tuple[tuple[int, tuple[str, ...], str], ...] = (
+    (41, ("kernel-power",),
+     "The machine lost power or locked up hard — Windows did not shut down "
+     "cleanly. This is logged on the *next* boot, so it describes the "
+     "previous crash."),
+    (6008, ("eventlog",), "Unexpected shutdown."),
+    (1001, ("windows error reporting", "bugcheck", "savedump"),
+     "Windows Error Reporting recorded a crash (often a bugcheck)."),
+    (7, ("disk", "storahci", "stornvme", "iastor"),
+     "The disk reported a bad block."),
+    (51, ("disk", "ntfs", "volmgr", "storahci", "stornvme", "iastor"),
+     "An error was detected during a paging operation — the drive failed a "
+     "read or write of the page file. Strongly associated with freezes."),
+    (153, ("disk", "storahci", "stornvme", "iastor", "vhdmp"),
+     "The storage driver retried or abandoned an I/O request."),
+    (129, ("storahci", "stornvme", "iastor", "disk", "vhdmp", "megasas",
+           "arcsas", "lsi"),
+     "The storage controller reset a device that stopped responding — a "
+     "classic cause of multi-second whole-system freezes."),
+    (157, ("disk",), "A disk was surprise-removed or dropped off the bus."),
+    (55, ("ntfs", "refs"),
+     "The file system detected corruption on a volume."),
+    (1, ("whea",), "A WHEA hardware error was recorded."),
+    (17, ("whea",), "A correctable hardware error was recorded."),
+    (18, ("whea",), "An uncorrectable hardware error was recorded."),
+    (219, ("kernel-pnp",), "A driver failed to load."),
+    (2004, ("resource-exhaustion",),
+     "Windows detected that the machine was running out of memory and "
+     "started trimming applications."),
+)
+
+
+def event_meaning(event_id: int, source: str) -> str:
+    """The meaning of an event, but only when the provider agrees."""
+    lowered = (source or "").lower()
+    for known_id, providers, meaning in EVENT_MEANINGS:
+        if known_id != event_id:
+            continue
+        if any(marker in lowered for marker in providers):
+            return meaning
+    return ""
+
+
+def event_matches(event_id: int, source: str, wanted_id: int,
+                  ) -> bool:
+    """Is this genuinely `wanted_id` from a provider that means it?"""
+    return event_id == wanted_id and bool(event_meaning(event_id, source))
 
 CRITICAL_SOURCES = ("disk", "Disk", "Ntfs", "volmgr", "storahci", "stornvme",
                     "WHEA-Logger", "Microsoft-Windows-WHEA-Logger",
@@ -421,7 +456,10 @@ def _recent_events(hours: int = 48, limit: int = 40) -> list[EventRecord]:
                     continue
                 event_id = int(getattr(event, "EventID", 0)) & 0xFFFF
                 source = str(getattr(event, "SourceName", ""))
-                meaning = INTERESTING_EVENTS.get(event_id, "")
+                # Only claim to know what an event means when the provider
+                # backs it up; otherwise keep it (it came from a provider we
+                # care about) but describe it with its own message text.
+                meaning = event_meaning(event_id, source)
                 relevant = bool(meaning) or any(
                     marker.lower() in source.lower()
                     for marker in CRITICAL_SOURCES)
@@ -625,8 +663,12 @@ def static_findings(facts: MachineFacts) -> list[dict]:
         })
 
     # Storage and power events are the two that explain hard freezes.
+    # `e.meaning` is only populated when the provider matched the id, so
+    # filtering on it keeps an unrelated Event 51 from a random service out
+    # of a finding that tells the user their drive is failing.
     storage_events = [e for e in facts.events
-                      if e.event_id in (7, 51, 153, 129, 157, 55)]
+                      if e.event_id in (7, 51, 153, 129, 157, 55)
+                      and e.meaning]
     if storage_events:
         out.append({
             "id": "storage-errors",
@@ -662,7 +704,8 @@ def static_findings(facts: MachineFacts) -> list[dict]:
     # is retrospective evidence: it proves the machine ran out of memory at
     # specific times in the past, including times the user was complaining
     # about and this tool was not running.
-    exhaustion = [e for e in facts.events if e.event_id == 2004]
+    exhaustion = [e for e in facts.events
+                  if e.event_id == 2004 and e.meaning]
     if exhaustion:
         span = ""
         if len(exhaustion) > 1:
@@ -708,7 +751,8 @@ def static_findings(facts: MachineFacts) -> list[dict]:
             ],
         })
 
-    power_events = [e for e in facts.events if e.event_id in (41, 6008)]
+    power_events = [e for e in facts.events
+                    if e.event_id in (41, 6008) and e.meaning]
     if power_events:
         out.append({
             "id": "hard-lockups",
@@ -735,8 +779,8 @@ def static_findings(facts: MachineFacts) -> list[dict]:
             ],
         })
 
-    whea = [e for e in facts.events if e.event_id in (1, 17, 18)
-            and "whea" in e.source.lower()]
+    whea = [e for e in facts.events
+            if e.event_id in (1, 17, 18) and e.meaning]
     if whea:
         out.append({
             "id": "hardware-errors",

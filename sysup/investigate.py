@@ -314,6 +314,12 @@ def investigate(finding: Finding, settings: Settings,
                    + (f"; system drive {disk.free / 1e9:.0f} GB free of "
                       f"{disk.total / 1e9:.0f} GB" if disk else ""))
 
+    # Narrow the catalogue to what this finding may legitimately reach for,
+    # *before* any scraped page reaches the model. The research text below is
+    # untrusted input; this is what stops a hostile page talking the planner
+    # into a real-but-unrelated action.
+    permitted = actions_mod.allowed_ids(finding.category)
+
     prompt = f"MACHINE\n{machine or 'Windows PC'}\n\n"
     if context:
         prompt += f"{context}\n\n"
@@ -325,8 +331,8 @@ def investigate(finding: Finding, settings: Settings,
         f"Evidence:\n{evidence}\n"
         + (f"Built-in remedies already known:\n{remedies}\n" if remedies else "")
         + f"\nWEB RESEARCH\n{_research_block(result.sources)}\n\n"
-        f"ACTIONS THIS TOOL CAN PERFORM (use these ids only)\n"
-        f"{actions_mod.summary_for_prompt()}\n\n"
+        f"ACTIONS PERMITTED FOR THIS FINDING (these ids and no others)\n"
+        f"{actions_mod.summary_for_prompt(permitted)}\n\n"
         f"Reply with the JSON object described in your instructions.")
 
     answer = client.chat(
@@ -356,12 +362,13 @@ def investigate(finding: Finding, settings: Settings,
                                if str(s).strip()][:8]
     chosen = parsed.get("actions")
     result.plan = actions_mod.plan_from_model(
-        chosen if isinstance(chosen, list) else [])
+        chosen if isinstance(chosen, list) else [], allowed=permitted)
 
     dropped = (len(chosen) if isinstance(chosen, list) else 0) - len(result.plan)
     if dropped > 0:
         # Worth saying out loud rather than silently: it means the model
-        # wanted to do something this tool deliberately cannot.
-        result.error = (f"{dropped} proposed step(s) were not real actions and "
-                        f"were discarded.")
+        # wanted to do something this tool deliberately cannot, or something
+        # outside what this kind of finding is allowed to touch.
+        result.error = (f"{dropped} proposed step(s) were not permitted for "
+                        f"this finding and were discarded.")
     return result

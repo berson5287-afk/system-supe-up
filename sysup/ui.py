@@ -159,7 +159,7 @@ class Dashboard:
         grid.add_row(cpu, memory, disk, faults)
         uptime = (time.time() - self.history.started) / 60
         title = (f"System Supe-Up  ·  watching {uptime:.0f} min  ·  "
-                 f"{len(self.history.samples)} samples")
+                 f"{self.history.count} samples")
         return Panel(grid, title=title, title_align="left", border_style="blue")
 
     def _alerts(self) -> Panel | None:
@@ -335,7 +335,7 @@ class Dashboard:
     def start_diagnosis(self) -> None:
         if self.state.diagnosing:
             return
-        if len(self.history.samples) < 5:
+        if self.history.count < 5:
             self.state.say("need a few more seconds of data first")
             return
         self.state.diagnosing = True
@@ -409,6 +409,10 @@ class Dashboard:
             self.save_snapshot()
         elif key == "p":
             state.paused = not state.paused
+            if not state.paused:
+                # Forget the pre-pause baseline, or the paused period is
+                # reported as scheduler lateness — a freeze that never was.
+                self.sampler.reset()
         elif key == "v":
             state.show_findings = not state.show_findings
         elif key in SORTS:

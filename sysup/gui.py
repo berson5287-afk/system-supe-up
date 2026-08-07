@@ -183,6 +183,20 @@ class SamplerThread(threading.Thread):
         self.stopped = threading.Event()
         self.sampler = Sampler()
 
+    def resume(self) -> None:
+        """Come back from a pause without inventing a freeze.
+
+        The sampler must forget its previous reading first. Otherwise the next
+        sample differences against a baseline from before the pause and reports
+        the entire paused period as scheduler lateness — a five-second pause
+        becomes a five-second "the whole machine stopped" alert. The
+        continuity guard in `Sampler.sample` catches long gaps, but a pause
+        shorter than that limit and longer than the stall threshold would slip
+        straight through it.
+        """
+        self.sampler.reset()
+        self.paused.clear()
+
     def run(self) -> None:
         self.sampler.sample()                      # prime; no rates yet
         next_tick = time.monotonic() + self.interval
@@ -469,7 +483,7 @@ class App(tk.Tk):
             state = "paused" if self.sampler.paused.is_set() else "watching"
             self.status_label.configure(
                 text=f"{state} · {minutes:.0f} min · "
-                     f"{len(self.history.samples)} samples")
+                     f"{self.history.count} samples")
             self.status_dot.configure(
                 fg=WARN if self.sampler.paused.is_set() else OK)
 
@@ -719,7 +733,7 @@ class App(tk.Tk):
     def _diagnose(self) -> None:
         if self.busy:
             return
-        if len(self.history.samples) < 5:
+        if self.history.count < 5:
             messagebox.showinfo("System Supe-Up",
                                 "Give it a few more seconds of data first.")
             return
@@ -930,7 +944,7 @@ class App(tk.Tk):
 
     def _toggle_pause(self) -> None:
         if self.sampler.paused.is_set():
-            self.sampler.paused.clear()
+            self.sampler.resume()
             self.pause_button.configure(text="Pause")
         else:
             self.sampler.paused.set()

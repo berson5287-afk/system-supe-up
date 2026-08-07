@@ -16,6 +16,7 @@ class of stalls (driver, paging, storage) that leave the CPU graph at 5%.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -72,6 +73,12 @@ class Sample:
     #: signal — see the module docstring.
     lateness: float = 0.0
     interval: float = 1.0
+    #: True when the gap since the previous sample was too long to reason
+    #: about — the monitor was paused, or the machine slept.  Such a sample
+    #: carries no rates and must never be read as a stall: the time was not
+    #: stolen by the system, it was time we were not watching.  Getting this
+    #: wrong reports a six-second pause as a six-second freeze.
+    discontinuity: bool = False
 
     cpu: float = 0.0
     cpu_per_core: list[float] = field(default_factory=list)
@@ -109,7 +116,7 @@ class Sample:
 
     @property
     def stalled(self) -> bool:
-        return self.lateness >= 2.5
+        return self.lateness >= 2.5 and not self.discontinuity
 
     def by_cpu(self, limit: int = 10) -> list[ProcRow]:
         return sorted(self.processes, key=lambda r: -r.cpu)[:limit]
@@ -130,6 +137,15 @@ class Sample:
         return None
 
 
+#: A gap longer than this cannot be a stall — it is a pause, a sleep, or a
+#: laptop lid. Windows does not withhold the CPU for ten seconds and then
+#: carry on; that is somebody closing the machine. Expressed as both an
+#: absolute floor and a multiple of the interval so it stays sensible whether
+#: sampling every 250 ms or every 5 seconds.
+CONTINUITY_LIMIT_S = 10.0
+CONTINUITY_MULTIPLE = 6.0
+
+
 class Sampler:
     """Holds the previous snapshot so each sample can be a rate."""
 
@@ -147,14 +163,46 @@ class Sampler:
         self._gui_cache: dict[int, tuple[int, int]] = {}
         self._gui_checked_at: float = 0.0
 
+    def reset(self) -> None:
+        """Forget the previous sample, so the next one is a fresh baseline.
+
+        Call this after anything that stops sampling for a while — a pause, a
+        resume from sleep, a settings change. Without it the next sample
+        differences against a stale baseline and reports the whole gap as
+        scheduler lateness, which is indistinguishable from a genuine freeze.
+        """
+        self._prev = {}
+        self._prev_at = 0.0
+        self._prev_disk = None
+        self._prev_net = None
+        self._prev_switches = None
+
     def sample(self, expected_interval: float = 1.0) -> Sample:
         now = time.monotonic()
         elapsed = (now - self._prev_at) if self._prev_at else expected_interval
         elapsed = max(elapsed, 1e-3)
 
-        sample = Sample(at=time.time(), interval=elapsed)
-        if self._prev_at:
+        # A gap far larger than we asked for means we were not running, not
+        # that the machine was not running. Rates across it would be averages
+        # over an unknown period, and its "lateness" is not a stall.
+        limit = max(CONTINUITY_LIMIT_S, expected_interval * CONTINUITY_MULTIPLE)
+        broken = bool(self._prev_at) and elapsed > limit
+
+        sample = Sample(at=time.time(), interval=elapsed,
+                        discontinuity=broken)
+        if self._prev_at and not broken:
             sample.lateness = max(0.0, elapsed - expected_interval)
+
+        if broken:
+            # Re-prime instead of reporting nonsense: read the machine's
+            # current state, but publish no rates derived from the old one.
+            self.reset()
+            current = winapi.snapshot_processes()
+            self._read_system(sample, elapsed)
+            self._read_processes(sample, current, elapsed)
+            self._prev = current
+            self._prev_at = now
+            return sample
 
         self._read_system(sample, elapsed)
         current = winapi.snapshot_processes()
@@ -312,16 +360,55 @@ class Sampler:
 
 
 class History:
-    """A ring buffer of samples, plus the stalls seen along the way."""
+    """A ring buffer of samples, plus the stalls seen along the way.
+
+    Read from one thread and written from another: the sampler appends on its
+    own thread while the interface and the rules read on theirs. A deque
+    append is atomic, but *iterating* one while it is appended to raises
+    "deque mutated during iteration" — and because `rules.analyse` catches
+    exceptions per rule so that one broken rule cannot take the monitor down,
+    that surfaced as findings silently going missing every so often rather
+    than as a crash.
+
+    So nothing hands out the live deque. Every reader gets a copy taken under
+    the lock, and works on that.
+    """
 
     def __init__(self, size: int = 300) -> None:
-        self.samples: deque[Sample] = deque(maxlen=size)
-        self.stalls: deque[dict] = deque(maxlen=50)
+        self._samples: deque[Sample] = deque(maxlen=size)
+        self._stalls: deque[dict] = deque(maxlen=50)
+        self._lock = threading.Lock()
         self.started = time.time()
 
+    # -- readers, all snapshot-based ---------------------------------------
+    @property
+    def samples(self) -> list[Sample]:
+        """A snapshot copy. Never the live deque — see the class docstring."""
+        with self._lock:
+            return list(self._samples)
+
+    @property
+    def stalls(self) -> list[dict]:
+        with self._lock:
+            return list(self._stalls)
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._samples)
+
+    def recent(self, count: int) -> list[Sample]:
+        with self._lock:
+            if count >= len(self._samples):
+                return list(self._samples)
+            return list(self._samples)[-count:]
+
     def add(self, sample: Sample, threshold: float = 2.5) -> dict | None:
-        self.samples.append(sample)
-        if sample.lateness < threshold:
+        with self._lock:
+            self._samples.append(sample)
+        # A pause or a sleep is not a freeze. `discontinuity` marks a gap we
+        # were not watching across, and its lateness is meaningless.
+        if sample.discontinuity or sample.lateness < threshold:
             return None
         # Name the most plausible cause at the moment of the stall, while the
         # evidence is still in hand — after the fact it is unrecoverable.
@@ -343,15 +430,19 @@ class History:
             "hung_windows": [
                 {"pid": w.pid, "title": w.title} for w in sample.hung_windows],
         }
-        self.stalls.append(stall)
+        with self._lock:
+            self._stalls.append(stall)
         return stall
 
     def latest(self) -> Sample | None:
-        return self.samples[-1] if self.samples else None
+        with self._lock:
+            return self._samples[-1] if self._samples else None
 
     def series(self, attribute: str, count: int = 60) -> list[float]:
-        values = [getattr(s, attribute, 0.0) for s in self.samples]
-        return values[-count:]
+        # Discontinuity samples carry no rates, so plotting them draws a
+        # false trough through every pause.
+        return [getattr(s, attribute, 0.0) for s in self.recent(count)
+                if not s.discontinuity]
 
     def average(self, attribute: str, count: int = 60) -> float:
         values = self.series(attribute, count)
@@ -370,7 +461,9 @@ class History:
         wolf every time something opens a file.
         """
         values = []
-        for sample in list(self.samples)[-count:]:
+        for sample in self.recent(count):
+            if sample.discontinuity:
+                continue
             row = sample.find(pid)
             if row is not None:
                 values.append(getattr(row, attribute, 0.0))
@@ -378,5 +471,5 @@ class History:
 
     def seen_hung(self, pid: int, count: int = 30) -> int:
         """How many of the recent samples had this process unresponsive."""
-        return sum(1 for sample in list(self.samples)[-count:]
+        return sum(1 for sample in self.recent(count)
                    if (row := sample.find(pid)) is not None and row.hung)

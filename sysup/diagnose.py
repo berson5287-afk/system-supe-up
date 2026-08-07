@@ -160,9 +160,9 @@ def build_brief(findings: list[Finding], facts: sysinfo.MachineFacts,
     lines.append(f"- {len(facts.startup)} programs start at sign-in")
 
     lines.append("\n## What was measured while watching")
-    minutes = (len(history.samples) * sample.interval) / 60
+    minutes = (history.count * sample.interval) / 60
     lines.append(f"- watched for {minutes:.1f} minutes "
-                 f"({len(history.samples)} samples)")
+                 f"({history.count} samples)")
     lines.append(f"- CPU: {history.average('cpu', 120):.0f}% average, "
                  f"{history.peak('cpu', 120):.0f}% peak")
     lines.append(f"- memory: {sample.memory_percent:.0f}% used, "
@@ -250,10 +250,10 @@ def diagnose(history: History, settings: Settings,
     say = on_progress or (lambda _m: None)
     started = time.perf_counter()
     sample = sample or history.latest()
-    result = Diagnosis(sample_count=len(history.samples))
+    result = Diagnosis(sample_count=history.count)
     if sample is None:
         return result
-    result.watched_s = len(history.samples) * sample.interval
+    result.watched_s = history.count * sample.interval
 
     say("reading machine configuration and event log")
     facts = sysinfo.gather()

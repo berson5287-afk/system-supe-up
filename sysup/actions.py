@@ -161,21 +161,55 @@ def action(spec: ActionSpec):
 def _check_smart(params: dict, dry_run: bool = False) -> ActionResult:
     if dry_run:
         return ActionResult(True, "Would read SMART status for each disk.")
+    # Emit one parseable line per drive. The original version searched the
+    # whole blob for "PredictFailure : False", which reported a healthy
+    # machine as long as *any* drive was fine — exactly backwards on the
+    # multi-drive systems where it matters most.
     code, output = _run([
         "powershell", "-NoProfile", "-NonInteractive", "-Command",
-        "Get-CimInstance -Namespace root\\wmi -ClassName MSStorageDriver_FailurePredictStatus "
-        "-ErrorAction SilentlyContinue | Select-Object InstanceName,PredictFailure,Reason | "
-        "Format-List; Get-CimInstance Win32_DiskDrive | "
-        "Select-Object Model,Status,Size | Format-List"], timeout=90)
-    if not output.strip():
+        "Get-CimInstance -Namespace root\\wmi "
+        "-ClassName MSStorageDriver_FailurePredictStatus "
+        "-ErrorAction SilentlyContinue | ForEach-Object { "
+        "'SMART|{0}|{1}|{2}' -f $_.InstanceName, $_.PredictFailure, $_.Reason };"
+        "Get-CimInstance Win32_DiskDrive | ForEach-Object { "
+        "'DISK|{0}|{1}|{2}' -f $_.Model, $_.Status, $_.Size }"], timeout=90)
+
+    drives: list[tuple[str, bool, str]] = []
+    disks: list[tuple[str, str]] = []
+    for line in (output or "").splitlines():
+        parts = line.strip().split("|")
+        if parts[0] == "SMART" and len(parts) >= 3:
+            predicts = parts[2].strip().lower() in ("true", "1")
+            drives.append((parts[1].strip(), predicts,
+                           parts[3].strip() if len(parts) > 3 else ""))
+        elif parts[0] == "DISK" and len(parts) >= 3:
+            disks.append((parts[1].strip(), parts[2].strip()))
+
+    if not drives and not disks:
         return ActionResult(False, "The drives did not report SMART data. "
-                                   "Many NVMe drives need vendor tooling.")
-    healthy = "PredictFailure : False" in output or "Status  : OK" in output
+                                   "Many NVMe drives need vendor tooling such "
+                                   "as CrystalDiskInfo to read it.")
+
+    failing = [name for name, predicts, _reason in drives if predicts]
+    unhealthy = [model for model, status in disks
+                 if status and status.upper() != "OK"]
+
+    lines = [f"{name}: {'FAILURE PREDICTED' if predicts else 'no failure predicted'}"
+             + (f" ({reason})" if reason else "")
+             for name, predicts, reason in drives]
+    lines += [f"{model}: status {status}" for model, status in disks]
+    detail = "\n".join(lines)
+
+    if failing or unhealthy:
+        named = ", ".join(failing + unhealthy)
+        return ActionResult(
+            True, f"At least one drive is reporting a problem: {named}. Back "
+                  f"up now and replace it — this is not a driver issue.",
+            output=detail)
     return ActionResult(
-        True,
-        "No failure predicted — the storage errors are more likely the driver."
-        if healthy else "Read the output below carefully.",
-        output=output)
+        True, f"All {len(drives) or len(disks)} drive(s) report healthy, so "
+              f"storage errors point at the driver or controller rather than "
+              f"at failing media.", output=detail)
 
 
 @action(ActionSpec(
@@ -344,13 +378,47 @@ def _restart_process(params: dict, dry_run: bool = False) -> ActionResult:
             False, f"Refusing to end {name}: it is not on the list of "
                    f"processes that are safe to close.")
 
+    # Windows reuses process ids, and freely. Between the moment the planner
+    # chose this pid and the moment somebody clicks Apply — which may be
+    # minutes, across a research round trip and a confirmation dialog — the
+    # original process can exit and an entirely unrelated one inherit the
+    # number. Killing by a stale pid is how a tool that promised to close a
+    # browser tab ends a database instead, so the identity is re-checked
+    # against the name here, immediately before the kill.
+    import psutil
+
+    try:
+        target = psutil.Process(pid)
+        actual = target.name()
+        created = target.create_time()
+    except psutil.NoSuchProcess:
+        return ActionResult(True, f"{name} (pid {pid}) has already exited — "
+                                  f"nothing to do.")
+    except (psutil.AccessDenied, OSError) as error:
+        return ActionResult(False, f"Could not verify pid {pid}: {error}")
+
+    if actual.lower() != name.lower():
+        return ActionResult(
+            False, f"Refusing: pid {pid} is now {actual}, not {name}. Windows "
+                   f"reuses process ids and this one has been recycled since "
+                   f"the plan was made. Re-run the diagnosis.")
+    # If the planner recorded when it saw the process, insist it is the same
+    # one. Names collide too — two chrome.exe are not interchangeable.
+    expected_created = params.get("create_time")
+    if expected_created is not None:
+        try:
+            if abs(float(expected_created) - created) > 1.0:
+                return ActionResult(
+                    False, f"Refusing: pid {pid} is a different {name} from "
+                           f"the one that was inspected.")
+        except (TypeError, ValueError):
+            pass
+
     # Browsers and Electron apps run one process per tab or window. Ending one
     # of twenty-one closes a tab and frees a fraction of what the name
     # suggests, so say so before it is approved rather than after.
     siblings, family_bytes = 0, 0
     try:
-        import psutil
-
         for other in psutil.process_iter(["name", "memory_info"]):
             if (other.info.get("name") or "").lower() == name.lower():
                 siblings += 1
@@ -439,17 +507,77 @@ def _wsl_cap(params: dict, dry_run: bool = False) -> ActionResult:
     if not 1 <= gigabytes <= 64:
         return ActionResult(False, "Refusing a cap outside 1–64 GB.")
     path = Path.home() / ".wslconfig"
+    existing = ""
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except OSError as error:
+            return ActionResult(False, f"Could not read {path}: {error}")
+
+    merged, replaced = _merge_wslconfig(existing, gigabytes)
     if dry_run:
-        return ActionResult(True, f"Would set WSL's memory cap to "
-                                  f"{gigabytes} GB in {path}.")
-    backup = path.read_text(encoding="utf-8") if path.exists() else None
+        note = (f"Would set WSL's memory cap to {gigabytes} GB in {path}.")
+        if existing:
+            other = [line.split("=")[0].strip()
+                     for line in existing.splitlines()
+                     if "=" in line and not line.strip().startswith("#")
+                     and not line.strip().lower().startswith("memory")]
+            note += (f"\n  {'Replacing' if replaced else 'Adding'} the memory "
+                     f"setting and keeping everything else"
+                     + (f" ({', '.join(other[:6])})" if other else ""))
+        return ActionResult(True, note)
+
     try:
-        path.write_text(f"[wsl2]\nmemory={gigabytes}GB\n", encoding="utf-8")
+        path.write_text(merged, encoding="utf-8")
     except OSError as error:
         return ActionResult(False, f"Could not write {path}: {error}")
     return ActionResult(
         True, f"WSL capped at {gigabytes} GB. Run 'wsl --shutdown' to apply.",
-        changed=True, undo={"path": str(path), "content": backup})
+        changed=True,
+        undo={"path": str(path), "content": existing if existing else None})
+
+
+def _merge_wslconfig(existing: str, gigabytes: int) -> tuple[str, bool]:
+    """Set memory= under [wsl2], leaving every other line exactly as it was.
+
+    `.wslconfig` carries processors, swap, kernel, networking and a dozen
+    other independent settings. Rewriting the file with a single memory line —
+    which is what this did originally — silently destroys all of them, and the
+    user does not find out until WSL next behaves strangely. Editing line by
+    line rather than through a config parser also preserves comments and
+    ordering, which a parser would quietly discard.
+    """
+    if not existing.strip():
+        return f"[wsl2]\nmemory={gigabytes}GB\n", False
+
+    lines = existing.splitlines()
+    out: list[str] = []
+    in_wsl2 = False
+    replaced = False
+    wsl2_end = -1
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if in_wsl2 and not replaced:
+                wsl2_end = len(out)     # remember where the section finished
+            in_wsl2 = stripped.lower() == "[wsl2]"
+        elif (in_wsl2 and not stripped.startswith("#")
+              and stripped.lower().replace(" ", "").startswith("memory=")):
+            out.append(f"memory={gigabytes}GB")
+            replaced = True
+            continue
+        out.append(line)
+
+    if not replaced:
+        if in_wsl2:                      # [wsl2] ran to the end of the file
+            out.append(f"memory={gigabytes}GB")
+        elif wsl2_end >= 0:              # insert at the end of the section
+            out.insert(wsl2_end, f"memory={gigabytes}GB")
+        else:                            # no [wsl2] section at all
+            out += ["", "[wsl2]", f"memory={gigabytes}GB"]
+
+    return "\n".join(out).rstrip("\n") + "\n", replaced
 
 
 # ------------------------------------------------------------------ startup
@@ -688,19 +816,44 @@ def _set_power_plan(params: dict, dry_run: bool = False) -> ActionResult:
 
 
 @action(ActionSpec(
-    id="sfc_scan",
-    title="Check Windows' own files for damage",
-    detail="Runs System File Checker. Takes several minutes and repairs "
-           "damaged Windows files if it finds any. Safe, but slow, and it "
-           "keeps a processor core busy while it runs.",
-    category="system", risk="medium", needs_admin=True, reversible=True,
-    expect="A report of whether anything was damaged and repaired."))
-def _sfc(params: dict, dry_run: bool = False) -> ActionResult:
+    id="sfc_verify",
+    title="Check Windows' own files for damage (report only)",
+    detail="Runs System File Checker in verify-only mode. It reports whether "
+           "protected Windows files have been altered and changes absolutely "
+           "nothing. Takes several minutes and keeps a processor core busy.",
+    category="diagnostic", risk="low", needs_admin=True, reversible=True,
+    expect="A report of whether anything is damaged. No repairs are made."))
+def _sfc_verify(params: dict, dry_run: bool = False) -> ActionResult:
     if dry_run:
-        return ActionResult(True, "Would run 'sfc /scannow' (several minutes).")
-    code, output = _run_elevated("cmd.exe", "/c sfc /scannow & pause")
-    return ActionResult(code == 0, "System file check finished." if code == 0
+        return ActionResult(True, "Would run 'sfc /verifyonly' — reports "
+                                  "damage, repairs nothing. Several minutes.")
+    code, output = _run_elevated("cmd.exe", "/c sfc /verifyonly & pause")
+    return ActionResult(code == 0, "Verification finished." if code == 0
                         else "The check did not complete.", output=output)
+
+
+@action(ActionSpec(
+    id="sfc_repair",
+    title="Repair damaged Windows files",
+    # Kept separate from the verify action, and marked irreversible, because
+    # /scannow does not merely inspect — it replaces protected system files
+    # from the component store. Describing that as a reversible diagnostic,
+    # which the original single action did, understates it considerably.
+    detail="Runs 'sfc /scannow', which REPLACES any protected Windows file it "
+           "considers damaged, using the component store as its source. There "
+           "is no undo. Run the verify-only check first and only do this if it "
+           "actually found something.",
+    category="system", risk="high", needs_admin=True, reversible=False,
+    undo_hint="None. Replaced system files cannot be put back.",
+    expect="Damaged files replaced; a log at %windir%\\Logs\\CBS\\CBS.log."))
+def _sfc_repair(params: dict, dry_run: bool = False) -> ActionResult:
+    if dry_run:
+        return ActionResult(True, "Would run 'sfc /scannow', which REPLACES "
+                                  "damaged system files. Not reversible.")
+    code, output = _run_elevated("cmd.exe", "/c sfc /scannow & pause")
+    return ActionResult(code == 0, "System file repair finished." if code == 0
+                        else "The repair did not complete.", changed=code == 0,
+                        output=output)
 
 
 # -------------------------------------------------------------------- undo
@@ -749,18 +902,72 @@ def catalogue() -> list[dict]:
     return [spec.describe() for spec in REGISTRY.values()]
 
 
-def plan_from_model(chosen: list[dict]) -> list[PlannedAction]:
+#: Which actions may even be offered for a given finding category.
+#:
+#: The catalogue already stops the model inventing a command. This stops it
+#: choosing a real but irrelevant one — which matters because the planner's
+#: context includes scraped web pages, and a page is attacker-influenceable
+#: text. Without this, a hostile page found while researching a disk error
+#: could try to talk the model into "disable_sysmain" or ending a process.
+#: With it, a disk finding can only ever reach for disk diagnostics, so the
+#: worst a successful injection achieves is a useless suggestion.
+ALLOWED_BY_CATEGORY: dict[str, tuple[str, ...]] = {
+    "disk": ("check_smart", "storage_driver_info", "chkdsk_scan",
+             "clear_temp_files", "run_disk_cleanup", "clear_thumbnail_cache"),
+    "hardware": ("check_smart", "storage_driver_info", "chkdsk_scan",
+                 "show_event_detail", "sfc_verify"),
+    "memory": ("unload_ollama_models", "restart_process", "set_wsl_memory_cap",
+               "disable_sysmain", "clear_temp_files", "show_event_detail",
+               "create_restore_point"),
+    "cpu": ("restart_process", "set_power_plan", "show_event_detail"),
+    "freeze": ("restart_process", "restart_explorer", "show_event_detail",
+               "check_smart", "storage_driver_info"),
+    "handles": ("restart_process", "restart_explorer",
+                "restart_audio_service"),
+    "threads": ("restart_process", "restart_explorer"),
+    "startup": ("disable_startup_item", "create_restore_point"),
+    "driver": ("storage_driver_info", "check_smart", "show_event_detail",
+               "sfc_verify"),
+    "security": (),          # never automate changes to security software
+    "system": ("create_restore_point", "sfc_verify", "clear_temp_files",
+               "run_disk_cleanup", "flush_dns"),
+    "network": ("flush_dns",),
+}
+
+#: Offered for anything, because they change nothing or are pure safety.
+ALWAYS_ALLOWED = ("show_event_detail", "create_restore_point")
+
+
+def allowed_ids(category: str) -> tuple[str, ...]:
+    """Action ids permitted for a finding of this category."""
+    allowed = ALLOWED_BY_CATEGORY.get((category or "").strip().lower())
+    if allowed is None:
+        # An unrecognised category gets diagnostics only. Failing closed here
+        # is the whole point of the mechanism.
+        return ALWAYS_ALLOWED
+    return tuple(dict.fromkeys(allowed + ALWAYS_ALLOWED))
+
+
+def plan_from_model(chosen: list[dict],
+                    allowed: tuple[str, ...] | None = None
+                    ) -> list[PlannedAction]:
     """Turn the model's choices into planned actions, dropping anything unknown.
 
     Silently ignoring an invented action id is the correct behaviour: the model
     occasionally proposes a plausible-sounding one that does not exist, and the
     alternative to dropping it is executing something nobody wrote.
+
+    `allowed` narrows this further to the actions relevant to one finding —
+    see `ALLOWED_BY_CATEGORY`.
     """
     planned: list[PlannedAction] = []
     for item in chosen or []:
         if not isinstance(item, dict):
             continue
-        spec = REGISTRY.get(str(item.get("id") or "").strip())
+        identifier = str(item.get("id") or "").strip()
+        if allowed is not None and identifier not in allowed:
+            continue
+        spec = REGISTRY.get(identifier)
         if spec is None:
             continue
         params = item.get("parameters")
@@ -814,12 +1021,22 @@ if _REGISTRY_PROBLEMS:      # pragma: no cover - a programming error, not input
                        + "\n  ".join(_REGISTRY_PROBLEMS))
 
 
-def summary_for_prompt() -> str:
-    """A compact catalogue for the model, grouped so it reads quickly."""
+def summary_for_prompt(only: tuple[str, ...] | None = None) -> str:
+    """A compact catalogue for the model, grouped so it reads quickly.
+
+    `only` restricts it to the actions valid for one finding. Showing the
+    model just the relevant handful, rather than all eighteen, both improves
+    its choices and means an injected instruction naming something outside
+    the list has nothing to point at.
+    """
     lines = []
     by_category: dict[str, list[ActionSpec]] = {}
     for spec in REGISTRY.values():
+        if only is not None and spec.id not in only:
+            continue
         by_category.setdefault(spec.category, []).append(spec)
+    if not by_category:
+        return "  (no automated action is appropriate for this finding)"
     for category, specs in sorted(by_category.items()):
         lines.append(f"\n{category.upper()}")
         for spec in specs:

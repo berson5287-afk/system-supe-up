@@ -234,7 +234,7 @@ def _rule_hung_apps(history: History, sample: Sample) -> list[Finding]:
             f"Windows reports {len(titles)} window(s) of this process as not "
             f"responding" + (" (already replaced with a ghost window)"
                              if ghosted else ""),
-            f"unresponsive in {seen} of the last {min(30, len(history.samples))} samples",
+            f"unresponsive in {seen} of the last {min(30, history.count)} samples",
             f"CPU {cpu:.1f}% sustained, {row.threads} threads, "
             f"{_mb(row.memory)} working set",
         ]
@@ -538,7 +538,7 @@ def _rule_paging_storm(history: History, sample: Sample) -> list[Finding]:
     heavy = average > HEAVY_PAGING_FAULTS
     top, top_rate = culprits[0]
     evidence = [f"machine-wide hard faults: {average:.0f}/s average over "
-                f"{min(30, len(history.samples))} samples"]
+                f"{min(30, history.count)} samples"]
     evidence += [f"{_name_of(row)}: {rate:.0f} hard faults/s"
                  for row, rate in culprits]
     evidence.append(f"disk busy {history.average('disk_busy', 30):.0f}% average")
@@ -632,7 +632,7 @@ def _rule_runaway_cpu(history: History, sample: Sample) -> list[Finding]:
     findings = []
     for row in sample.by_cpu(6):
         average = history.sustained(row.pid, "cpu", 30)
-        if average < RUNAWAY_CPU or len(history.samples) < 10:
+        if average < RUNAWAY_CPU or history.count < 10:
             continue
         kernel = history.sustained(row.pid, "cpu_kernel", 30)
         fact = knowledge.lookup(row.name)
@@ -640,7 +640,7 @@ def _rule_runaway_cpu(history: History, sample: Sample) -> list[Finding]:
 
         explanation = (
             f"{_name_of(row)} has held {average:.0f}% of this machine's total "
-            f"CPU capacity across the last {min(30, len(history.samples))} "
+            f"CPU capacity across the last {min(30, history.count)} "
             f"samples. Sustained load like that is not a task finishing; it "
             f"is a loop.")
         if in_kernel:
@@ -697,7 +697,7 @@ def _rule_disk_saturation(history: History, sample: Sample) -> list[Finding]:
     both reachable and closer to the thing that hurts, because it is literally
     the time an application spends stopped.
     """
-    if len(history.samples) < 10:
+    if history.count < 10:
         return []
     latency = history.average("disk_latency_ms", 30)
     busy = history.average("disk_busy", 30)
@@ -735,7 +735,7 @@ def _rule_disk_saturation(history: History, sample: Sample) -> list[Finding]:
 
     evidence = [
         f"average service time {latency:.1f} ms per operation over "
-        f"{min(30, len(history.samples))} samples",
+        f"{min(30, history.count)} samples",
         f"{history.average('disk_ops', 30):,.0f} operations/s, disk busy "
         f"{busy:.1f}%",
         f"read {history.average('disk_read_bps', 30) / 1e6:.1f} MB/s, "
@@ -823,7 +823,7 @@ def _rule_lock_contention(history: History, sample: Sample) -> list[Finding]:
             continue
         # Confirm it persists — a lock held for one sample is normal.
         persistent = sum(
-            1 for s in list(history.samples)[-15:]
+            1 for s in history.recent(15)
             if (r := s.find(row.pid)) and r.waits.buckets.get("lock", 0) >= 2)
         if persistent < 8:
             continue
@@ -866,7 +866,7 @@ def _rule_blocked_on_other_process(history: History,
         if stuck < 3 or row.pid in hung_pids:
             continue
         persistent = sum(
-            1 for s in list(history.samples)[-15:]
+            1 for s in history.recent(15)
             if (r := s.find(row.pid)) and r.waits.buckets.get("ipc", 0) >= 3)
         if persistent < 10:
             continue
@@ -1037,14 +1037,14 @@ def _rule_thread_explosion(history: History, sample: Sample) -> list[Finding]:
 
 
 def _rule_memory_leak(history: History, sample: Sample) -> list[Finding]:
-    if len(history.samples) < 60:
+    if history.count < 60:
         return []       # a leak claim needs a real window to stand on
     findings = []
     for row in sorted(sample.processes, key=lambda r: -r.private)[:8]:
         growth = _growth(history, row.pid, "private")
         if growth < LEAK_GROWTH_BYTES:
             continue
-        minutes = (len(history.samples) * sample.interval) / 60 or 1
+        minutes = (history.count * sample.interval) / 60 or 1
         fact = knowledge.lookup(row.name)
         findings.append(Finding(
             id=f"leak:{row.pid}",
@@ -1109,7 +1109,7 @@ def _rule_kernel_pool(history: History, sample: Sample) -> list[Finding]:
 
 def _rule_cpu_starvation(history: History, sample: Sample) -> list[Finding]:
     ready = history.average("ready_threads", 30)
-    if ready < STARVED_READY_THREADS or len(history.samples) < 15:
+    if ready < STARVED_READY_THREADS or history.count < 15:
         return []
     cpu = history.average("cpu", 30)
     top = sample.by_cpu(3)
@@ -1127,7 +1127,7 @@ def _rule_cpu_starvation(history: History, sample: Sample) -> list[Finding]:
             f"its turn. Adding more work will not slow the machine down "
             f"gracefully from here — it goes straight to stuttering."),
         evidence=[f"{ready:.1f} ready threads on average over "
-                  f"{min(30, len(history.samples))} samples",
+                  f"{min(30, history.count)} samples",
                   f"CPU {cpu:.0f}% average, peak "
                   f"{history.peak('cpu', 60):.0f}%",
                   f"context switches: "

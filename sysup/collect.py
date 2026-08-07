@@ -23,7 +23,9 @@ from dataclasses import dataclass, field
 
 import psutil
 
-from . import winapi
+# Shapes only — the Windows implementation is reached through the backend,
+# so importing this module does not load ctypes.
+from .telemetry import HungWindow, ProcSnapshot, ThreadWaits
 
 #: 100ns kernel ticks per second.
 TICKS_PER_SECOND = 10_000_000
@@ -45,7 +47,7 @@ class ProcRow:
     read_bps: float = 0.0
     write_bps: float = 0.0
     io_ops: float = 0.0          # read+write operations per second
-    waits: winapi.ThreadWaits = field(default_factory=winapi.ThreadWaits)
+    waits: ThreadWaits = field(default_factory=ThreadWaits)
     hung: bool = False           # Windows says a window of this process is dead
     title: str = ""
     #: Windows terminal-services session. 0 is where services live; anything
@@ -87,7 +89,18 @@ class Sample:
     memory_total: int = 0
     memory_available: int = 0
     swap_percent: float = 0.0
+    #: Commit charge against the commit limit — RAM plus page file. This is
+    #: what Windows actually refuses allocations on, so it is a different
+    #: question from "how full is the RAM", and the two can disagree in both
+    #: directions. Measured via GetPerformanceInfo; it used to be physical
+    #: memory percentage under another name, which made the distinction
+    #: impossible to draw.
     commit_percent: float = 0.0
+    commit_total: int = 0
+    commit_limit: int = 0
+    commit_peak: int = 0
+    kernel_paged: int = 0
+    kernel_nonpaged: int = 0
 
     disk_read_bps: float = 0.0
     disk_write_bps: float = 0.0
@@ -111,7 +124,7 @@ class Sample:
     context_switches: float = 0.0
 
     processes: list[ProcRow] = field(default_factory=list)
-    hung_windows: list[winapi.HungWindow] = field(default_factory=list)
+    hung_windows: list[HungWindow] = field(default_factory=list)
     ready_threads: int = 0       # threads wanting CPU but not getting it
 
     @property
@@ -149,9 +162,17 @@ CONTINUITY_MULTIPLE = 6.0
 class Sampler:
     """Holds the previous snapshot so each sample can be a rate."""
 
-    def __init__(self, cpu_count: int | None = None) -> None:
+    def __init__(self, cpu_count: int | None = None, backend=None) -> None:
+        # The backend is where every Windows-specific reading comes from.
+        # Injecting it is what lets the rules be exercised against machine
+        # states that real hardware will not produce on request — see
+        # `telemetry.FakeBackend`.
+        if backend is None:
+            from .telemetry import default_backend
+            backend = default_backend()
+        self.backend = backend
         self.cpu_count = cpu_count or psutil.cpu_count(logical=True) or 1
-        self._prev: dict[int, winapi.ProcSnapshot] = {}
+        self._prev: dict[int, ProcSnapshot] = {}
         self._prev_at: float = 0.0
         self._prev_disk = None
         self._prev_net = None
@@ -197,7 +218,7 @@ class Sampler:
             # Re-prime instead of reporting nonsense: read the machine's
             # current state, but publish no rates derived from the old one.
             self.reset()
-            current = winapi.snapshot_processes()
+            current = self.backend.snapshot_processes()
             self._read_system(sample, elapsed)
             self._read_processes(sample, current, elapsed)
             self._prev = current
@@ -205,7 +226,7 @@ class Sampler:
             return sample
 
         self._read_system(sample, elapsed)
-        current = winapi.snapshot_processes()
+        current = self.backend.snapshot_processes()
         self._read_processes(sample, current, elapsed)
 
         self._prev = current
@@ -228,11 +249,21 @@ class Sampler:
             sample.memory_available = memory.available
             swap = psutil.swap_memory()
             sample.swap_percent = swap.percent
-            # On Windows psutil's "swap" is the page file, but the number that
-            # actually predicts an out-of-memory stall is total commit against
-            # the commit limit — RAM plus page file — because Windows refuses
-            # allocations on that, not on free RAM.
-            sample.commit_percent = memory.percent
+        except Exception:
+            pass
+
+        # Commit is the number that predicts an out-of-memory stall, because
+        # Windows refuses allocations against the commit limit rather than
+        # against free RAM. Read it properly rather than aliasing physical use.
+        try:
+            info = self.backend.memory_info()
+            if info.commit_limit:
+                sample.commit_percent = info.commit_percent
+                sample.commit_total = info.commit_total
+                sample.commit_limit = info.commit_limit
+                sample.commit_peak = info.commit_peak
+                sample.kernel_paged = info.kernel_paged
+                sample.kernel_nonpaged = info.kernel_nonpaged
         except Exception:
             pass
 
@@ -278,9 +309,9 @@ class Sampler:
 
     # -- per process -------------------------------------------------------
     def _read_processes(self, sample: Sample,
-                        current: dict[int, winapi.ProcSnapshot],
+                        current: dict[int, ProcSnapshot],
                         elapsed: float) -> None:
-        hung = winapi.hung_windows()
+        hung = self.backend.hung_windows()
         sample.hung_windows = hung
         hung_pids = {window.pid for window in hung}
 
@@ -338,7 +369,7 @@ class Sampler:
 
     def _attach_titles(self, rows: list[ProcRow], gui_pids: set[int],
                        hung_pids: set[int]) -> None:
-        titles = winapi.window_titles_for(gui_pids)
+        titles = self.backend.window_titles_for(gui_pids)
 
         now = time.monotonic()
         refresh = (now - self._gui_checked_at) > 5.0
@@ -349,7 +380,7 @@ class Sampler:
             watch = set(titles) | hung_pids
             self._gui_cache = {}
             for pid in list(watch)[:40]:
-                gdi, user_objects = winapi.gui_resources(pid)
+                gdi, user_objects = self.backend.gui_resources(pid)
                 if gdi or user_objects:
                     self._gui_cache[pid] = (gdi, user_objects)
 

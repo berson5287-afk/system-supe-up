@@ -28,6 +28,7 @@ from tkinter import messagebox, ttk
 
 from . import diagnose as diagnose_mod, knowledge, report as report_mod, rules
 from .collect import History, ProcRow, Sample, Sampler
+from .incidents import IncidentRecorder
 from .config import REPORT_DIR, Settings
 
 # ------------------------------------------------------------------- palette
@@ -166,6 +167,7 @@ class Gauge(tk.Canvas):
 class Tick:
     sample: Sample
     stall: dict | None
+    incident: object = None
 
 
 class SamplerThread(threading.Thread):
@@ -182,6 +184,10 @@ class SamplerThread(threading.Thread):
         self.paused = threading.Event()
         self.stopped = threading.Event()
         self.sampler = Sampler()
+        # Preserves the telemetry either side of every stall, so an
+        # intermittent freeze can be examined after the fact instead of only
+        # while somebody happens to be watching the gauges.
+        self.recorder = IncidentRecorder(history)
 
     def resume(self) -> None:
         """Come back from a pause without inventing a freeze.
@@ -218,7 +224,11 @@ class SamplerThread(threading.Thread):
                 continue
             stall = self.history.add(sample, self.threshold)
             try:
-                self.out.put_nowait(Tick(sample, stall))
+                incident = self.recorder.on_sample(sample, stall)
+            except Exception:
+                incident = None
+            try:
+                self.out.put_nowait(Tick(sample, stall, incident))
             except queue.Full:
                 pass
 
@@ -236,6 +246,7 @@ class App(tk.Tk):
         self._rebuilding = False
         self.busy = False
         self.last_report = None
+        self.last_incident = None
         self.started_at = time.time()
         self._ticks = 0
         self._sort_column = "cpu"
@@ -461,13 +472,18 @@ class App(tk.Tk):
         """Pull whatever the sampler produced and redraw once."""
         latest = None
         stalled = False
+        incident = None
         try:
             while True:
                 tick = self.queue.get_nowait()
                 latest = tick.sample
                 stalled = stalled or tick.stall is not None
+                incident = tick.incident or incident
         except queue.Empty:
             pass
+
+        if incident is not None:
+            self._incident_ready(incident)
 
         if latest is not None:
             self._ticks += 1
@@ -488,6 +504,53 @@ class App(tk.Tk):
                 fg=WARN if self.sampler.paused.is_set() else OK)
 
         self.after(150, self._drain)
+
+    def _incident_ready(self, incident) -> None:
+        """A freeze finished being recorded — offer the forensics."""
+        self.last_incident = incident
+        self.progress.configure(
+            text=f"⚠  Freeze recorded: {incident.lateness:.1f}s — "
+                 f"{incident.verdict()[0][:70]}")
+        window = tk.Toplevel(self)
+        window.title("Freeze recorded")
+        window.configure(bg=BG)
+        window.geometry("760x560")
+
+        tk.Label(window, text=f"System stall — {incident.lateness:.2f} seconds",
+                 bg=BG, fg=TEXT, font=FONT_TITLE, anchor="w").pack(
+            fill="x", padx=18, pady=(16, 2))
+        tk.Label(window,
+                 text="The telemetry from either side of this freeze has been "
+                      "kept, so it can be examined now rather than guessed at "
+                      "later.",
+                 bg=BG, fg=DIM, font=FONT_SMALL, anchor="w", justify="left",
+                 wraplength=700).pack(fill="x", padx=18, pady=(0, 8))
+
+        holder = tk.Frame(window, bg=BG)
+        holder.pack(fill="both", expand=True, padx=18, pady=4)
+        text = tk.Text(holder, bg=PANEL, fg="#d5dae4", font=FONT_MONO,
+                       wrap="word", bd=0, highlightthickness=0, padx=14,
+                       pady=12, cursor="arrow")
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        text.insert("end", incident.summary())
+        text.configure(state="disabled")
+
+        buttons = tk.Frame(window, bg=BG)
+        buttons.pack(fill="x", padx=18, pady=(6, 16))
+        flat_button(buttons, "Open incident folder",
+                    self._open_incidents, primary=True).pack(side="left")
+        flat_button(buttons, "Close", window.destroy).pack(side="right")
+
+    def _open_incidents(self) -> None:
+        from .incidents import INCIDENT_DIR
+        INCIDENT_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            subprocess.Popen(["explorer", str(INCIDENT_DIR)])
+        except OSError:
+            webbrowser.open(INCIDENT_DIR.as_uri())
 
     def _refresh_gauges(self, sample: Sample) -> None:
         self.gauges["cpu"].update_values(

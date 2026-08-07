@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wintypes
-from dataclasses import dataclass, field
 
 ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -43,123 +42,17 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 GR_GDIOBJECTS = 0
 GR_USEROBJECTS = 1
 
-# Windows' own default ceiling per process.  Both are registry-tunable, but
-# almost nobody tunes them, so treating 10,000 as the wall is right in practice.
-GUI_OBJECT_LIMIT = 10_000
+psapi = ctypes.WinDLL("psapi", use_last_error=True)
 
 
-# --------------------------------------------------------------- wait reasons
-
-# KWAIT_REASON.  The names are the kernel's own; the groupings below are what
-# turn them into an explanation.
-WAIT_REASONS: dict[int, str] = {
-    0: "Executive", 1: "FreePage", 2: "PageIn", 3: "PoolAllocation",
-    4: "DelayExecution", 5: "Suspended", 6: "UserRequest", 7: "WrExecutive",
-    8: "WrFreePage", 9: "WrPageIn", 10: "WrPoolAllocation",
-    11: "WrDelayExecution", 12: "WrSuspended", 13: "WrUserRequest",
-    14: "WrEventPair", 15: "WrQueue", 16: "WrLpcReceive", 17: "WrLpcReply",
-    18: "WrVirtualMemory", 19: "WrPageOut", 20: "WrRendezvous",
-    21: "WrKeyedEvent", 22: "WrTerminated", 23: "WrProcessInSwap",
-    24: "WrCpuRateControl", 25: "WrCalloutStack", 26: "WrKernel",
-    27: "WrResource", 28: "WrPushLock", 29: "WrMutex", 30: "WrQuantumEnd",
-    31: "WrDispatchInt", 32: "WrPreempted", 33: "WrYieldExecution",
-    34: "WrFastMutex", 35: "WrGuardedMutex", 36: "WrRundown",
-    37: "WrAlertByThreadId", 38: "WrDeferredPreempt", 39: "WrPhysicalFault",
-    40: "WrIoRing", 41: "WrMdlCache", 42: "WrRcu",
-}
-
-THREAD_STATES: dict[int, str] = {
-    0: "Initialized", 1: "Ready", 2: "Running", 3: "Standby",
-    4: "Terminated", 5: "Waiting", 6: "Transition", 7: "Unknown",
-}
-
-# The whole point of this module.  A process with 400 threads parked on
-# `WrQueue` is a healthy thread pool; a process with 3 threads on `WrPageIn` is
-# a machine that needs more RAM.  Only the second kind is worth reporting.
-#
-# Each bucket carries the plain-English consequence, because "your threads are
-# in WrPushLock" helps nobody.
-WAIT_BUCKETS: dict[str, dict] = {
-    "paging": {
-        "reasons": {1, 2, 8, 9, 18, 19, 23, 39},
-        "label": "waiting for memory / page file",
-        "meaning": (
-            "threads are stopped dead waiting for RAM to be fetched back off "
-            "the disk. This is the classic cause of a whole-machine freeze "
-            "that ends by itself after several seconds"),
-        "severity": 3,
-    },
-    "lock": {
-        # WrEventPair is deliberately absent: it is the legacy csrss
-        # client/server handshake, and it idles in exactly this state.
-        "reasons": {21, 27, 28, 29, 34, 35, 36},
-        "label": "blocked on a lock",
-        "meaning": (
-            "threads are waiting on a lock another thread is holding. If this "
-            "does not clear, it is a deadlock and the app will never come "
-            "back on its own"),
-        "severity": 3,
-    },
-    "ipc": {
-        # WrLpcReply only.  Its sibling WrLpcReceive means "I am a server
-        # sitting idle waiting for someone to call me", which is the *resting*
-        # state of csrss.exe and every RPC service on the machine — counting it
-        # here accuses the Windows subsystem of being blocked on every healthy
-        # boot.  Waiting for a reply is the blocked one; waiting for a request
-        # is a job description.
-        "reasons": {17},
-        "label": "waiting on another process",
-        "meaning": (
-            "threads are blocked on an RPC/COM call into a different process, "
-            "so this app is a victim rather than the cause — the process it is "
-            "calling is what actually needs fixing"),
-        "severity": 2,
-    },
-    "kernel": {
-        "reasons": {0, 7, 25, 26, 40, 41},
-        "label": "waiting in a driver / kernel call",
-        "meaning": (
-            "threads are inside a kernel or driver call that has not returned. "
-            "Sustained waits here usually mean a slow or misbehaving driver, "
-            "commonly storage, network or anti-virus filter drivers"),
-        "severity": 2,
-    },
-    "pool": {
-        "reasons": {3, 10},
-        "label": "waiting for kernel memory",
-        "meaning": (
-            "threads are waiting for kernel pool memory to become available. "
-            "This is serious — the system is close to a resource wall and will "
-            "become unstable, not merely slow"),
-        "severity": 4,
-    },
-    "starved": {
-        "reasons": {24, 30, 31, 32, 33},
-        "label": "starved of CPU time",
-        "meaning": (
-            "threads are ready to run but cannot get a turn on the processor, "
-            "so something else is monopolising the CPU or the CPU is being "
-            "throttled"),
-        "severity": 2,
-    },
-}
-
-# Waits that mean "this thread has nothing to do", which is the overwhelming
-# majority of every wait on a healthy system.  Counting these as evidence is
-# how naive tools conclude that a perfectly idle machine is in crisis.
-#
-# 16 (WrLpcReceive) and 14 (WrEventPair) are here rather than in a bucket
-# because they are how an idle *server* waits — see the note on the "ipc"
-# bucket.  Getting this wrong makes csrss.exe look permanently deadlocked.
-BENIGN_REASONS = {4, 5, 6, 11, 12, 13, 14, 15, 16, 20, 22}
-
-
-def classify_wait(reason: int) -> str:
-    """Which diagnostic bucket a KWAIT_REASON falls into ("" if benign)."""
-    for name, bucket in WAIT_BUCKETS.items():
-        if reason in bucket["reasons"]:
-            return name
-    return ""
+# The wait-reason tables, the shapes and the bucket definitions live in
+# `telemetry`, which has no ctypes in it so that the rules can be tested
+# without Windows.  They are re-exported here because this module used to own
+# them and callers still reach for `winapi.ProcSnapshot`.
+from .telemetry import (                                       # noqa: E402
+    BENIGN_REASONS, GUI_OBJECT_LIMIT, HungWindow, MemoryInfo, ProcSnapshot,
+    THREAD_STATES, ThreadWaits, WAIT_BUCKETS, WAIT_REASONS, classify_wait,
+)
 
 
 # ------------------------------------------------------------------- structs
@@ -244,59 +137,7 @@ ntdll.NtQuerySystemInformation.argtypes = [
 ntdll.NtQuerySystemInformation.restype = ctypes.c_ulong
 
 
-# -------------------------------------------------------------------- results
-
-@dataclass
-class ThreadWaits:
-    """Wait analysis for one process, already reduced to what matters."""
-
-    total: int = 0
-    running: int = 0
-    ready: int = 0
-    benign: int = 0
-    #: bucket name -> how many threads are stuck there
-    buckets: dict[str, int] = field(default_factory=dict)
-    #: the single most significant non-benign bucket, or ""
-    dominant: str = ""
-
-    @property
-    def stuck(self) -> int:
-        return sum(self.buckets.values())
-
-    def describe(self) -> str:
-        if not self.dominant:
-            return ""
-        bucket = WAIT_BUCKETS[self.dominant]
-        count = self.buckets.get(self.dominant, 0)
-        return (f"{count} of {self.total} threads {bucket['label']}")
-
-
-@dataclass
-class ProcSnapshot:
-    """One process as the kernel sees it, at one instant."""
-
-    pid: int = 0
-    name: str = ""
-    threads: int = 0
-    hard_faults: int = 0
-    page_faults: int = 0
-    handles: int = 0
-    session: int = 0
-    cycle_time: int = 0
-    #: 100ns units, as the kernel reports them.  Differencing two samples is
-    #: how CPU% is derived, which costs nothing extra — psutil's per-process
-    #: cpu_percent would mean re-opening every process on every tick.
-    kernel_time: int = 0
-    user_time: int = 0
-    create_time: int = 0
-    private_bytes: int = 0
-    working_set: int = 0
-    read_ops: int = 0
-    write_ops: int = 0
-    read_bytes: int = 0
-    write_bytes: int = 0
-    waits: ThreadWaits = field(default_factory=ThreadWaits)
-
+# ------------------------------------------------------------------- reading
 
 def snapshot_processes() -> dict[int, ProcSnapshot]:
     """Every process, with its threads already classified.  {} on failure.
@@ -388,12 +229,7 @@ def snapshot_processes() -> dict[int, ProcSnapshot]:
             else:
                 waits.benign += 1
 
-        if waits.buckets:
-            # Severity first, then how many threads are affected — one thread
-            # deadlocked on a lock outranks nine parked in a driver call.
-            waits.dominant = max(
-                waits.buckets,
-                key=lambda b: (WAIT_BUCKETS[b]["severity"], waits.buckets[b]))
+        waits.settle()
         snap.waits = waits
         processes[snap.pid] = snap
 
@@ -459,17 +295,6 @@ def _resolve_ghost(hwnd, pid: int) -> tuple[int, int]:
         return hwnd, pid
     real_pid = _pid_of(real)
     return (real, real_pid) if real_pid else (hwnd, pid)
-
-
-@dataclass
-class HungWindow:
-    pid: int
-    title: str
-    hwnd: int
-    #: True when this was found as a ghost, i.e. Windows has already given up
-    #: on the app and painted the stand-in.  A stronger signal than a window
-    #: that has merely missed the 5-second mark.
-    ghosted: bool = False
 
 
 def hung_windows() -> list[HungWindow]:
@@ -569,3 +394,94 @@ def gui_resources(pid: int) -> tuple[int, int]:
                 int(user32.GetGuiResources(handle, GR_USEROBJECTS)))
     finally:
         kernel32.CloseHandle(handle)
+
+
+# ------------------------------------------------------------------- commit
+
+class PERFORMANCE_INFORMATION(ctypes.Structure):
+    """What `GetPerformanceInfo` returns.  Every size is in *pages*.
+
+    This is here for one field in particular: `CommitLimit`. Windows refuses
+    an allocation when the commit charge reaches that limit — RAM plus page
+    file — not when physical memory runs out. Reporting physical usage as
+    "commit", which this program did until now, makes two completely
+    different conditions indistinguishable: a machine at 95% physical with
+    plenty of commit headroom is fine, and a machine at 60% physical that is
+    near its commit limit is about to start failing allocations.
+    """
+
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("CommitTotal", ctypes.c_size_t),
+        ("CommitLimit", ctypes.c_size_t),
+        ("CommitPeak", ctypes.c_size_t),
+        ("PhysicalTotal", ctypes.c_size_t),
+        ("PhysicalAvailable", ctypes.c_size_t),
+        ("SystemCache", ctypes.c_size_t),
+        ("KernelTotal", ctypes.c_size_t),
+        ("KernelPaged", ctypes.c_size_t),
+        ("KernelNonpaged", ctypes.c_size_t),
+        ("PageSize", ctypes.c_size_t),
+        ("HandleCount", wintypes.DWORD),
+        ("ProcessCount", wintypes.DWORD),
+        ("ThreadCount", wintypes.DWORD),
+    ]
+
+
+psapi.GetPerformanceInfo.argtypes = [
+    ctypes.POINTER(PERFORMANCE_INFORMATION), wintypes.DWORD]
+psapi.GetPerformanceInfo.restype = wintypes.BOOL
+
+
+def memory_info() -> MemoryInfo:
+    """Commit charge, commit limit and kernel pools.  Zeroed on failure."""
+    info = PERFORMANCE_INFORMATION()
+    info.cb = ctypes.sizeof(PERFORMANCE_INFORMATION)
+    try:
+        if not psapi.GetPerformanceInfo(ctypes.byref(info), info.cb):
+            return MemoryInfo()
+    except OSError:
+        return MemoryInfo()
+
+    page = int(info.PageSize) or 4096
+    return MemoryInfo(
+        commit_total=int(info.CommitTotal) * page,
+        commit_limit=int(info.CommitLimit) * page,
+        commit_peak=int(info.CommitPeak) * page,
+        physical_total=int(info.PhysicalTotal) * page,
+        physical_available=int(info.PhysicalAvailable) * page,
+        system_cache=int(info.SystemCache) * page,
+        kernel_paged=int(info.KernelPaged) * page,
+        kernel_nonpaged=int(info.KernelNonpaged) * page,
+        page_size=page,
+        handle_count=int(info.HandleCount),
+        process_count=int(info.ProcessCount),
+        thread_count=int(info.ThreadCount),
+    )
+
+
+# ------------------------------------------------------------------ backend
+
+class WindowsBackend:
+    """The real telemetry source, satisfying `telemetry.TelemetryBackend`.
+
+    A thin object rather than bare module functions purely so that a `Sampler`
+    can be handed a different one — see `telemetry.FakeBackend`, which is how
+    the rules get tested against machine states real hardware will not produce
+    on demand.
+    """
+
+    def snapshot_processes(self) -> dict[int, ProcSnapshot]:
+        return snapshot_processes()
+
+    def hung_windows(self) -> list[HungWindow]:
+        return hung_windows()
+
+    def window_titles_for(self, pids: set[int]) -> dict[int, str]:
+        return window_titles_for(pids)
+
+    def gui_resources(self, pid: int) -> tuple[int, int]:
+        return gui_resources(pid)
+
+    def memory_info(self) -> MemoryInfo:
+        return memory_info()

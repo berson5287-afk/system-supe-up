@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+
+# This tool's own output. Reports describe the machine they were taken on —
+# process names, window titles, event log entries — so they are personal to
+# whoever ran it and must never be committed.
+reports/
+*.report.html
+diagnosis-*.html
+diagnosis-*.md
+
+# Settings hold server addresses for someone's own network.
+*.settings.json
+process-research.json
+
+# Windows
+Thumbs.db
+desktop.ini

@@ -1,0 +1,7 @@
+psutil>=5.9        # per-process and machine-wide counters
+rich>=13.0         # the live terminal dashboard
+requests>=2.28     # Ollama and SearXNG
+
+# Optional — the tool runs without it, but the system event log is one of the
+# best sources of freeze evidence there is, and this is how it is read.
+pywin32>=305

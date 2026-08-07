@@ -323,6 +323,17 @@ def investigate(finding: Finding, settings: Settings,
     prompt = f"MACHINE\n{machine or 'Windows PC'}\n\n"
     if context:
         prompt += f"{context}\n\n"
+    # What has already been tried on this machine, and what it measurably
+    # achieved. Local, earned evidence — and the only thing that stops the
+    # investigator confidently re-proposing a remedy which has already done
+    # nothing here three times.
+    try:
+        from .journal import Journal
+        history = Journal().advice()
+    except Exception:
+        history = ""
+    if history:
+        prompt += f"{history}\n\n"
     prompt += (
         f"THE FINDING (measured from the kernel — treat as fact)\n"
         f"Title: {finding.title}\n"

@@ -16,11 +16,13 @@ The shape of this window is the safety design made visible:
 from __future__ import annotations
 
 import threading
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 from . import actions as actions_mod, investigate as investigate_mod
 from .config import Settings
+from .journal import Journal, capture_state, verify
 from .rules import Finding
 
 BG = "#12141a"
@@ -60,12 +62,16 @@ def _button(parent, text, command, primary=False, **kwargs):
 
 class FixDialog(tk.Toplevel):
     def __init__(self, parent, finding: Finding, settings: Settings,
-                 facts=None, sample=None) -> None:
+                 facts=None, sample=None, sampler=None) -> None:
         super().__init__(parent)
         self.finding = finding
         self.settings = settings
         self.facts = facts
         self.sample = sample
+        #: Used to take a fresh reading after a change, so "did it work" is
+        #: measured rather than asserted.
+        self.sampler = sampler
+        self.journal = Journal()
         self.investigation: investigate_mod.Investigation | None = None
         self.rows: list[tuple[actions_mod.PlannedAction, tk.BooleanVar]] = []
         self.cancel = threading.Event()
@@ -148,8 +154,11 @@ class FixDialog(tk.Toplevel):
         self.apply_button = _button(foot, "Apply selected", self._apply,
                                     primary=True, state="disabled")
         self.apply_button.pack(side="right")
-        self.undo_button = _button(foot, "Undo last", self._undo,
-                                   state="disabled")
+        self.undo_button = _button(
+            foot, "Undo last", self._undo,
+            # Enabled if anything anywhere is still reversible, including
+            # changes made in a previous session.
+            state="normal" if self.journal.undoable() else "disabled")
         self.undo_button.pack(side="right", padx=(0, 8))
         _button(foot, "Close", self._close).pack(side="right", padx=(0, 8))
 
@@ -356,6 +365,7 @@ class FixDialog(tk.Toplevel):
 
         def work() -> None:
             confirm_each = bool(self.settings.get("confirm_every_action", True))
+            verified: list = []
             for planned in chosen:
                 if self.cancel.is_set():
                     break
@@ -365,14 +375,70 @@ class FixDialog(tk.Toplevel):
                     continue
                 self.after(0, lambda p=planned: self.status.configure(
                     text=f"running: {p.spec.title}…"))
+
+                # Written before the action runs, so a half-completed change
+                # that kills the app still leaves a record and its undo data.
+                before = capture_state(self._fresh_sample(), planned.params)
+                entry = self.journal.record(planned, before,
+                                            finding=self.finding.title)
+
                 result = actions_mod.apply(planned, dry_run=False)
                 planned.result = result
                 if result.ok and result.undo:
                     self._undo_stack.append((planned.spec.title, result.undo))
+                self.journal.complete(entry, result)
+                if result.ok and result.changed:
+                    verified.append((planned, entry))
                 self.after(0, lambda p=planned, r=result: self._set_result(p, r))
+
+            if verified and not self.cancel.is_set():
+                self._verify_all(verified)
             self.after(0, self._applied)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _fresh_sample(self):
+        """A reading taken now, falling back to the one the dialog opened with."""
+        if self.sampler is not None:
+            try:
+                return self.sampler.sample(1.0)
+            except Exception:
+                pass
+        return self.sample
+
+    def _verify_all(self, verified: list) -> None:
+        """Let the changes settle, then measure whether they actually helped."""
+        from .journal import SETTLE_SECONDS
+
+        self.after(0, lambda: self.status.configure(
+            text=f"measuring the effect ({SETTLE_SECONDS:.0f}s)…"))
+        # Wait on the cancel event rather than sleeping, so closing the window
+        # does not leave a thread counting to eight.
+        self.cancel.wait(SETTLE_SECONDS)
+        if self.cancel.is_set():
+            return
+        sample = self._fresh_sample()
+        for planned, entry in verified:
+            after = capture_state(sample, planned.params)
+            verdict, changes = verify(entry, after)
+            self.journal.complete(entry, planned.result, after, verdict)
+            self.after(0, lambda p=planned, v=verdict, c=changes:
+                       self._show_verdict(p, v, c))
+
+    def _show_verdict(self, planned, verdict: str, changes: list) -> None:
+        widget = getattr(planned, "_result_widget", None)
+        if widget is None:
+            return
+        colour = {"helped": OK, "made things worse": DANGER}.get(verdict, DIM)
+        lines = [f"{verdict}"]
+        lines += [f"   {change.describe()}" for change in changes[:3]]
+        try:
+            existing = widget.cget("text")
+            widget.configure(text=existing + "\n" + "\n".join(lines),
+                             fg=colour if verdict == "helped" else
+                             widget.cget("fg"))
+        except tk.TclError:
+            pass
 
     def _ask_on_main(self, planned) -> bool:
         """Ask on the UI thread and block the worker until answered."""
@@ -417,13 +483,30 @@ class FixDialog(tk.Toplevel):
             self.undo_button.configure(state="normal")
 
     def _undo(self) -> None:
-        if not self._undo_stack:
+        """Reverse the most recent reversible change, from the journal.
+
+        Read from disk rather than from this window's own stack, so a change
+        made in an earlier session — or before a crash — can still be walked
+        back. That was the point of persisting it.
+        """
+        pending = self.journal.undoable()
+        if not pending:
+            messagebox.showinfo("Undo", "There is nothing recorded that can "
+                                        "be undone.", parent=self)
+            self.undo_button.configure(state="disabled")
             return
-        title, record = self._undo_stack.pop()
-        result = actions_mod.undo(record)
-        messagebox.showinfo("Undo", f"{title}\n\n{result.message}",
+        entry = pending[0]
+        when = time.strftime("%d %b %H:%M", time.localtime(entry.at))
+        if not messagebox.askyesno(
+                "Undo", f"Reverse this change?\n\n{entry.title}\n{when}",
+                parent=self):
+            return
+        result = actions_mod.undo(entry.undo or {})
+        if result.ok:
+            self.journal.mark_undone(entry)
+        messagebox.showinfo("Undo", f"{entry.title}\n\n{result.message}",
                             parent=self)
-        if not self._undo_stack:
+        if not self.journal.undoable():
             self.undo_button.configure(state="disabled")
 
     def _close(self) -> None:

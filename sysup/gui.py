@@ -329,6 +329,8 @@ class App(tk.Tk):
                                                            padx=(0, 6))
         flat_button(right, "Reports", self._open_reports).pack(side="left",
                                                               padx=(0, 6))
+        flat_button(right, "History", self._open_history).pack(side="left",
+                                                               padx=(0, 6))
         self.pause_button = flat_button(right, "Pause", self._toggle_pause)
         self.pause_button.pack(side="left", padx=(0, 6))
         flat_button(right, "⚙", self._open_settings).pack(side="left")
@@ -873,6 +875,109 @@ class App(tk.Tk):
                     primary=True).pack(side="left")
         flat_button(buttons, "Close", window.destroy).pack(side="right")
 
+    def _open_history(self) -> None:
+        """Everything this tool has ever changed here, and whether it helped.
+
+        The point of keeping the journal is that it accumulates into local
+        knowledge: after a few weeks this window answers "does restarting
+        Explorer actually fix this on my machine" with measurements rather
+        than folklore.
+        """
+        from .journal import Journal
+
+        journal = Journal()
+        entries = journal.entries(200)
+
+        window = tk.Toplevel(self)
+        window.title("What has been changed")
+        window.configure(bg=BG)
+        window.geometry("880x620")
+
+        tk.Label(window, text="Action history", bg=BG, fg=TEXT,
+                 font=FONT_TITLE, anchor="w").pack(fill="x", padx=18,
+                                                   pady=(16, 2))
+        tk.Label(window,
+                 text=(f"{len(entries)} recorded · {journal.path}"
+                       if entries else
+                       "Nothing has been changed on this machine yet."),
+                 bg=BG, fg=DIM, font=FONT_SMALL, anchor="w").pack(
+            fill="x", padx=18, pady=(0, 8))
+
+        holder = tk.Frame(window, bg=BG)
+        holder.pack(fill="both", expand=True, padx=18, pady=4)
+        text = tk.Text(holder, bg=PANEL, fg="#d5dae4", font=FONT_MONO,
+                       wrap="word", bd=0, highlightthickness=0, padx=14,
+                       pady=12, cursor="arrow")
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        text.tag_configure("good", foreground=OK)
+        text.tag_configure("bad", foreground=DANGER)
+        text.tag_configure("dim", foreground=DIM)
+        text.tag_configure("head", font=("Consolas", 9, "bold"),
+                           foreground=TEXT)
+
+        for entry in entries:
+            when = time.strftime("%d %b %H:%M", time.localtime(entry.at))
+            text.insert("end", f"{when}  {entry.title}\n", "head")
+            if entry.reason:
+                text.insert("end", f"    why: {entry.reason}\n", "dim")
+            if entry.result_ok is None:
+                text.insert("end", "    started but never recorded an "
+                                   "outcome — the app may have been closed "
+                                   "or died mid-change\n", "bad")
+            else:
+                tag = ("good" if entry.verdict == "helped"
+                       else "bad" if entry.verdict == "made things worse"
+                       else "dim")
+                state = entry.verdict or ("done" if entry.result_ok
+                                          else "failed")
+                text.insert("end", f"    {state}: {entry.result_message}\n",
+                            tag)
+                for change in entry.changes():
+                    if change.significant():
+                        text.insert("end", f"      {change.describe()}\n",
+                                    "good" if change.better else "bad")
+            if entry.undone_at:
+                text.insert("end", "    (undone)\n", "dim")
+            text.insert("end", "\n")
+
+        summary = journal.advice()
+        if summary:
+            text.insert("end", "\n" + summary + "\n", "head")
+        text.configure(state="disabled")
+
+        buttons = tk.Frame(window, bg=BG)
+        buttons.pack(fill="x", padx=18, pady=(6, 16))
+        pending = journal.undoable()
+        if pending:
+            flat_button(
+                buttons, f"Undo last change ({pending[0].title[:30]})",
+                lambda: self._undo_from_history(journal, window)).pack(
+                side="left")
+        flat_button(buttons, "Close", window.destroy).pack(side="right")
+
+    def _undo_from_history(self, journal, window) -> None:
+        from . import actions as actions_mod
+
+        pending = journal.undoable()
+        if not pending:
+            return
+        entry = pending[0]
+        if not messagebox.askyesno(
+                "Undo", f"Reverse this change?\n\n{entry.title}\n"
+                        f"{time.strftime('%d %b %H:%M', time.localtime(entry.at))}",
+                parent=window):
+            return
+        result = actions_mod.undo(entry.undo or {})
+        if result.ok:
+            journal.mark_undone(entry)
+        messagebox.showinfo("Undo", result.message, parent=window)
+        window.destroy()
+        self._open_history()
+
     def _open_settings(self) -> None:
         from .settings_dialog import SettingsDialog
         SettingsDialog(self, self.settings, on_saved=self._settings_saved)
@@ -909,7 +1014,8 @@ class App(tk.Tk):
             facts = sysinfo.gather(include_events=False)
         except Exception:
             facts = None
-        FixDialog(self, finding, self.settings, facts=facts, sample=sample)
+        FixDialog(self, finding, self.settings, facts=facts, sample=sample,
+                  sampler=self.sampler.sampler)
 
     def _explain_finding(self) -> None:
         if self.busy or self.selected_finding is None:

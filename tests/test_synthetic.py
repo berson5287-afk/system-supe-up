@@ -335,6 +335,106 @@ def test_wait_chains() -> None:
           rules._chain_evidence(row3, make_sample(processes=[row3])) == [])
 
 
+# ---------------------------------------------------------------- journal
+
+def test_action_journal(tmp: Path) -> None:
+    """Recording, verification, crash-survival and local learning."""
+    print("")
+    print("action journal")
+    from sysup import actions
+    from sysup.journal import Journal, capture_state, verify
+
+    path = tmp / "journal.jsonl"
+    journal = Journal(path)
+    planned = actions.PlannedAction(
+        spec=actions.REGISTRY["restart_explorer"], params={"pid": 4242},
+        reason="clear leaked handles")
+
+    before_sample = make_sample(
+        memory_available=2_000_000_000, hard_faults=900.0,
+        processes=[row(4242, "explorer.exe", handles=19000, threads=660,
+                       private=400_000_000)])
+    before = capture_state(before_sample, planned.params)
+    check("captures machine and process state",
+          "memory_available" in before and before.get("proc_handles") == 19000)
+
+    entry = journal.record(planned, before, finding="Explorer has 660 threads")
+    check("intent written before the action runs",
+          path.exists() and len(journal.entries()) == 1)
+    check("entry has no outcome yet", journal.entries()[0].result_ok is None)
+
+    # The action succeeds and things genuinely improve.
+    result = actions.ActionResult(True, "Explorer restarted.", changed=True,
+                                  undo={"kind": "service", "name": "X",
+                                        "start": "auto"})
+    after_sample = make_sample(
+        memory_available=3_400_000_000, hard_faults=40.0,
+        processes=[row(4242, "explorer.exe", handles=900, threads=90,
+                       private=180_000_000)])
+    after = capture_state(after_sample, planned.params)
+    verdict, changes = verify(entry, after)
+    journal.complete(entry, result, after, verdict)
+
+    check("verdict is 'helped'", verdict == "helped", verdict)
+    described = " | ".join(c.describe() for c in changes)
+    check("quantifies the handle drop", "handles held fell" in described,
+          described[:100])
+    check("quantifies memory recovered", "available memory rose" in described)
+
+    # Later lines supersede earlier ones for the same id.
+    check("one merged entry, not two", len(journal.entries()) == 1,
+          f"{len(journal.entries())} entries")
+    check("outcome now recorded", journal.entries()[0].verdict == "helped")
+
+    # Undo survives losing the process entirely.
+    reopened = Journal(path)
+    check("undo survives a restart", len(reopened.undoable()) == 1)
+    reopened.mark_undone(reopened.undoable()[0])
+    check("undone entries drop out", not Journal(path).undoable())
+
+    # Noise must not be reported as an effect.
+    entry2 = journal.record(planned, before)
+    tiny = dict(before)
+    tiny["memory_available"] = before["memory_available"] + 5_000_000
+    verdict2, changes2 = verify(entry2, tiny)
+    check("5 MB drift is not called an improvement",
+          verdict2 == "no measurable change", verdict2)
+    journal.complete(entry2, actions.ActionResult(True, "done", changed=True),
+                     tiny, verdict2)
+
+    # Things getting worse must be said out loud.
+    entry3 = journal.record(planned, before)
+    worse = dict(before)
+    worse["memory_available"] = before["memory_available"] - 900_000_000
+    worse["hard_faults"] = 2000.0
+    verdict3, _ = verify(entry3, worse)
+    check("a regression is reported as worse",
+          verdict3 == "made things worse", verdict3)
+    journal.complete(entry3, actions.ActionResult(True, "done", changed=True),
+                     worse, verdict3)
+
+    # A killed process counts as success whatever else moved.
+    killer = actions.PlannedAction(spec=actions.REGISTRY["restart_process"],
+                                   params={"pid": 4242, "name": "x.exe"})
+    entry4 = journal.record(killer, {"proc_exists": 1.0})
+    verdict4, _ = verify(entry4, {"proc_exists": 0.0})
+    check("ending a process counts as helped", verdict4 == "helped", verdict4)
+
+    # And the learning: advice reflects what actually happened here.
+    advice = journal.advice()
+    check("advice names the action", "restart_explorer" in advice)
+    check("advice counts helped and unchanged",
+          "helped 1" in advice and "no measurable change 1" in advice,
+          advice.splitlines()[-1] if advice else "none")
+
+    # A torn final line, as a crash would leave.
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"id": "broken", "at": 1.0, "acti')
+    check("a torn line costs one entry, not the log",
+          len(Journal(path).entries()) >= 2,
+          f"{len(Journal(path).entries())} entries readable")
+
+
 def main() -> int:
     import tempfile
 
@@ -349,10 +449,11 @@ def main() -> int:
                 test()
             except Exception as error:
                 check(f"{test.__name__} raised", False, repr(error))
-        try:
-            test_incident_capture(Path(folder))
-        except Exception as error:
-            check("test_incident_capture raised", False, repr(error))
+        for scoped in (test_incident_capture, test_action_journal):
+            try:
+                scoped(Path(folder))
+            except Exception as error:
+                check(f"{scoped.__name__} raised", False, repr(error))
 
     passed = sum(1 for _n, ok, _d in RESULTS if ok)
     print("\n" + "=" * 74)

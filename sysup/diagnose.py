@@ -22,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import knowledge, research as research_mod, rules, sysinfo
+from .bridge import bridge
 from .collect import History, Sample
 from .config import Settings
 from .knowledge import Fix
@@ -255,14 +256,22 @@ def diagnose(history: History, settings: Settings,
         return result
     result.watched_s = history.count * sample.interval
 
+    feed = bridge()
+    feed.emit("diagnose.begin", samples=history.count,
+              watched_s=round(result.watched_s, 1), use_model=use_model)
+
     say("reading machine configuration and event log")
-    facts = sysinfo.gather()
+    with feed.span("diagnose.facts") as note:
+        facts = sysinfo.gather()
+        note(events=len(facts.events), startup=len(facts.startup))
     result.facts = facts
 
     say("running the diagnostic rules")
     findings = list(rules.analyse(history, sample))
-    findings += [_finding_from_static(raw)
-                 for raw in sysinfo.static_findings(facts)]
+    static = [_finding_from_static(raw) for raw in sysinfo.static_findings(facts)]
+    feed.emit("rules.static", fired=len(static),
+              titles=[f.title for f in static])
+    findings += static
     findings.sort(key=lambda f: f.sort_key())
     result.findings = findings
 
@@ -275,6 +284,7 @@ def diagnose(history: History, settings: Settings,
                 if cancel is not None and cancel.is_set():
                     break
                 say(f"looking up {name}")
+                feed.emit("research.process", name=name)
                 found = researcher.identify(name, emit=lambda m: say(m))
                 if found and found.sources:
                     result.researched[name] = found
@@ -303,9 +313,13 @@ def diagnose(history: History, settings: Settings,
          {"role": "user", "content": USER_TEMPLATE.format(brief=brief)}],
         on_token=on_token, cancel=cancel,
         temperature=float(settings.get("temperature", 0.2)),
-        num_ctx=int(settings.get("max_context_window", 32768)))
+        num_ctx=int(settings.get("max_context_window", 32768)),
+        purpose="diagnosis narrative")
     result.narrative = narrative
     result.duration_s = time.perf_counter() - started
+    feed.emit("diagnose.end", findings=len(findings),
+              narrative_chars=len(narrative),
+              duration_s=round(result.duration_s, 1), model=model)
     return result
 
 
@@ -340,5 +354,6 @@ def triage(finding: Finding, settings: Settings,
         f"Evidence:\n{evidence}\n\n"
         f"In three sentences or fewer: what should the owner of this machine "
         f"do about this right now, and what will it actually change?",
-        cancel=cancel, temperature=0.2, num_ctx=8192, num_predict=300)
+        cancel=cancel, temperature=0.2, num_ctx=8192, num_predict=300,
+        purpose=f"triage: {finding.id}")
     return answer or finding.explanation

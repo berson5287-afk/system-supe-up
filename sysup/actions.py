@@ -23,7 +23,6 @@ it applies.
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import shutil
@@ -37,6 +36,8 @@ from pathlib import Path
 import requests
 
 from . import knowledge
+from .bridge import bridge
+from .elevate import is_admin
 
 #: Keeps a console window from flashing up for every command.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -44,11 +45,10 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
-def is_admin() -> bool:
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
+# `is_admin` is imported from elevate.py, which owns everything to do with
+# elevation now that the whole app can optionally be relaunched as
+# administrator. Re-exported here because half the codebase reads it from
+# `actions`, and one definition beats two that could disagree.
 
 
 def _run(command: list[str], timeout: int = 120) -> tuple[int, str]:
@@ -79,7 +79,10 @@ def _run_elevated(command: str, arguments: str, wait: bool = True) -> tuple[int,
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
         timeout=600)
     if "canceled by the user" in output or "cancelled" in output.lower():
-        return 1, "The administrator prompt was declined."
+        return 1, ("The administrator prompt was declined."
+                   + ("" if is_admin() else
+                      " (Running System Supe-Up as administrator would ask "
+                      "once, at startup, instead of once per action.)"))
     return code, output
 
 
@@ -856,6 +859,373 @@ def _sfc_repair(params: dict, dry_run: bool = False) -> ActionResult:
                         output=output)
 
 
+# ------------------------------------------------------------------ tune-up
+# Changes that make a working machine faster, as opposed to repairs for one
+# that is broken. Every one of them is reversible and records the value it
+# found before changing it, because "make it faster" is exactly the category
+# where an irreversible change is not worth having.
+
+#: The power-scheme disk subgroup, and the AHCI Link Power Management setting
+#: inside it. Both are hidden from the Power Options window by default, which
+#: is precisely why the remedy for one of the commonest causes of multi-second
+#: storage stalls is not something a user can reach.
+_SUB_DISK = "0012ee47-9041-4b5d-9b77-535fba8b1442"
+_HIPM_DIPM = "0b2d69d7-a2a1-449c-9680-f91c70521c60"
+
+#: 0 Active (the link is never powered down) .. 3 Lowest. Anything above 0
+#: saves a little power, and is what leaves a controller having to wake a
+#: drive that went to sleep underneath an outstanding request.
+_LPM_MODES = {"off": 0, "hipm": 1, "hipm+dipm": 2, "lowest": 3}
+_LPM_NAMES = {0: "Active (link power management off)", 1: "HIPM",
+              2: "HIPM + DIPM", 3: "Lowest (HIPM + DIPM + DevSleep)"}
+
+
+def _setting_index(line: str) -> int:
+    try:
+        return int(line.split(":")[-1].strip(), 16)
+    except ValueError:
+        return -1
+
+
+def link_power_management() -> tuple[int, int]:
+    """Current AC and DC Link Power Management indexes; (-1, -1) if unknown.
+
+    Read-only and needs no elevation, so the tune-up scan can ask about it on
+    every machine without producing a prompt.
+    """
+    code, output = _run(["powercfg", "/q", "SCHEME_CURRENT", _SUB_DISK,
+                         _HIPM_DIPM], timeout=30)
+    if code != 0:
+        return -1, -1
+    alternating = direct = -1
+    for line in output.splitlines():
+        lowered = line.lower()
+        if "current ac power setting index" in lowered:
+            alternating = _setting_index(line)
+        elif "current dc power setting index" in lowered:
+            direct = _setting_index(line)
+    return alternating, direct
+
+
+@action(ActionSpec(
+    id="set_link_power_management",
+    title="Stop the drive link powering down between requests",
+    detail="Sets AHCI Link Power Management to Active in the current power "
+           "plan. While it is on, the controller lets the link to the drive "
+           "drop into a low-power state between requests and has to wake it "
+           "for the next one. On the Intel RST controllers where this goes "
+           "wrong the wake occasionally does not complete, and Windows resets "
+           "the device instead -- logged as iaStorAC event 129, and felt as "
+           "the whole machine freezing for several seconds. Turning it off "
+           "costs a small amount of idle power and nothing else.",
+    category="disk", risk="medium", needs_admin=True, reversible=True,
+    undo_hint="The previous AC and DC values are recorded and restored "
+              "exactly.",
+    params={"mode": "'off' to stop the link idling (the point of this), or "
+                    "'hipm', 'hipm+dipm', 'lowest' to put it back"},
+    expect="No further iaStorAC event 129 resets in the system log. Watch for "
+           "a few days -- they were intermittent to begin with."))
+def _set_link_power(params: dict, dry_run: bool = False) -> ActionResult:
+    wanted = str(params.get("mode") or "off").strip().lower()
+    if wanted not in _LPM_MODES:
+        return ActionResult(False, f"Mode must be one of "
+                                   f"{', '.join(_LPM_MODES)}.")
+    value = _LPM_MODES[wanted]
+    was_ac, was_dc = link_power_management()
+    if was_ac < 0:
+        return ActionResult(False, "This power plan does not expose the AHCI "
+                                   "link power setting, so there is nothing "
+                                   "to change here.")
+    if was_ac == value and was_dc in (value, -1):
+        return ActionResult(True, f"Already set to {_LPM_NAMES[value]} -- "
+                                  f"nothing to do.")
+    if dry_run:
+        return ActionResult(
+            True, f"Would set AHCI Link Power Management to "
+                  f"{_LPM_NAMES[value]}; it is currently "
+                  f"{_LPM_NAMES.get(was_ac, was_ac)} on mains"
+                  + (f" and {_LPM_NAMES.get(was_dc, was_dc)} on battery."
+                     if was_dc >= 0 else "."))
+    code, output = _run_elevated(
+        "cmd.exe",
+        f"/c powercfg /setacvalueindex SCHEME_CURRENT {_SUB_DISK} "
+        f"{_HIPM_DIPM} {value} && powercfg /setdcvalueindex SCHEME_CURRENT "
+        f"{_SUB_DISK} {_HIPM_DIPM} {value} && powercfg /setactive "
+        f"SCHEME_CURRENT")
+    if code != 0:
+        return ActionResult(False, "Could not change the setting.",
+                            output=output)
+    return ActionResult(
+        True, f"AHCI Link Power Management is now {_LPM_NAMES[value]}.",
+        changed=True, output=output,
+        undo={"kind": "lpm", "ac": was_ac, "dc": was_dc})
+
+
+def memory_compression() -> bool | None:
+    """Is Windows compressing memory rather than paging it out?  None = unknown.
+
+    Asked of the process list first, because `Get-MMAgent` refuses to answer
+    without administrator rights -- and a probe that needs a UAC prompt to
+    read a setting is not one a background scan can use. When compression is
+    on, Windows runs a hidden system process to hold the compressed store, so
+    its presence answers the question for free and without elevation. The
+    PowerShell call stays as the fallback for the case where the process list
+    cannot be read either.
+    """
+    try:
+        import psutil
+
+        for process in psutil.process_iter(["name"]):
+            name = (process.info.get("name") or "").lower()
+            if name in ("memcompression", "memory compression"):
+                return True
+        found_any = True
+    except Exception:
+        found_any = False
+    if found_any:
+        # The list was readable and the process was not in it.
+        return False
+
+    code, output = _run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "(Get-MMAgent).MemoryCompression"], timeout=45)
+    if code != 0:
+        return None
+    text = output.strip().lower()
+    if text.startswith("true"):
+        return True
+    if text.startswith("false"):
+        return False
+    return None
+
+
+@action(ActionSpec(
+    id="set_memory_compression",
+    title="Turn on memory compression",
+    detail="Windows can compress a page of memory instead of writing it out "
+           "to the page file. Compressing costs microseconds and paging costs "
+           "milliseconds, so on a machine short of RAM this converts a large "
+           "part of the hard-fault traffic -- the thing that actually causes "
+           "the freezing -- into a little extra CPU. That is the right trade "
+           "on a machine with spare cores and no spare memory.",
+    category="memory", risk="low", needs_admin=True, reversible=True,
+    undo_hint="Turned off again with Disable-MMAgent -mc.",
+    params={"enabled": "true to turn it on, false to turn it off"},
+    expect="Hard page faults per second fall; Task Manager shows a "
+           "'Compressed' figure against memory in use."))
+def _set_memory_compression(params: dict, dry_run: bool = False) -> ActionResult:
+    wanted = params.get("enabled", True)
+    if isinstance(wanted, str):
+        wanted = wanted.strip().lower() in ("1", "true", "yes", "on")
+    wanted = bool(wanted)
+    current = memory_compression()
+    if current is wanted:
+        return ActionResult(True, f"Memory compression is already "
+                                  f"{'on' if wanted else 'off'}.")
+    if dry_run:
+        state = "on" if current else "off" if current is False else "unknown"
+        return ActionResult(True, f"Would turn memory compression "
+                                  f"{'on' if wanted else 'off'}; it is "
+                                  f"currently {state}.")
+    verb = "Enable-MMAgent -mc" if wanted else "Disable-MMAgent -mc"
+    code, output = _run_elevated(
+        "powershell.exe", f"-NoProfile -NonInteractive -Command \"{verb}\"")
+    if code != 0:
+        return ActionResult(False, "Could not change memory compression.",
+                            output=output)
+    return ActionResult(
+        True, f"Memory compression turned {'on' if wanted else 'off'}.",
+        changed=True, output=output,
+        undo=({"kind": "mmagent", "enabled": bool(current)}
+              if current is not None else None))
+
+
+#: Services this tool is willing to touch, and what each one costs to leave
+#: running.  An allowlist rather than a check, because "set a service to
+#: disabled" is a general-purpose weapon and the model is choosing the target:
+#: anything not named here -- every security agent, every core Windows service
+#: -- cannot be reached through this action at all.
+TUNABLE_SERVICES: dict[str, str] = {
+    "SysMain": "Superfetch. Pre-loads applications into RAM speculatively; on "
+               "an SSD it buys almost nothing, and on a machine short of "
+               "memory it competes with the applications you are using.",
+    "DoSvc": "Delivery Optimization. Uploads Windows updates to other "
+             "machines, and can hold the disk and the network for hours.",
+    "DiagTrack": "Connected User Experiences and Telemetry. Sends diagnostic "
+                 "data to Microsoft and writes continuously.",
+    "MapsBroker": "Downloaded Maps Manager. Does nothing unless the Maps app "
+                  "is used offline.",
+    "RetailDemo": "Retail Demo mode. Only shop display machines use it.",
+    "WMPNetworkSvc": "Windows Media Player network sharing.",
+    "Fax": "The fax service.",
+    "RemoteRegistry": "Lets other machines edit this one's registry. Normally "
+                      "disabled already.",
+    "WSearch": "Windows Search indexing. CAUTION: turning this off removes "
+               "search inside Outlook and in File Explorer. Only worth doing "
+               "if the indexer is measurably the thing hurting the machine.",
+    "SupportAssistAgent": "Dell SupportAssist. Documented to leak memory "
+                          "steadily with uptime.",
+    "DellSupportAssistRemedationService": "Dell SupportAssist's remediation "
+                                          "half.",
+    "DDVCollectorSvcApi": "Dell Data Vault collector.",
+    "DDVDataCollector": "Dell Data Vault collector.",
+    "DDVRulesProcessor": "Dell Data Vault rules processor.",
+}
+
+_START_TYPES = {0: "boot", 1: "system", 2: "automatic", 3: "manual",
+                4: "disabled"}
+_START_VALUES = {"automatic": 2, "auto": 2, "manual": 3, "demand": 3,
+                 "disabled": 4}
+
+
+def service_start_type(name: str) -> str:
+    """How a service is set to start, read straight from the registry.
+
+    Cheap enough to call for a list of services during a scan, unlike
+    `Get-Service`, which costs a PowerShell start-up each time.
+    """
+    try:
+        with winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE,
+                rf"SYSTEM\CurrentControlSet\Services\{name}", 0,
+                winreg.KEY_READ) as key:
+            value, _kind = winreg.QueryValueEx(key, "Start")
+    except OSError:
+        return ""
+    return _START_TYPES.get(int(value), str(value))
+
+
+@action(ActionSpec(
+    id="set_service_startup",
+    title="Change how a background service starts",
+    detail="Sets a Windows service to disabled, manual or automatic, and "
+           "stops it if it is being disabled. Only services on this tool's "
+           "vetted list can be reached -- no security agent and no core "
+           "Windows service is on that list, whatever is asked for.",
+    category="tuneup", risk="medium", needs_admin=True, reversible=True,
+    undo_hint="The previous start type is recorded and restored.",
+    params={"service": "The service name, from the vetted list",
+            "startup": "'disabled', 'manual' or 'automatic'"},
+    expect="The service stops competing for memory, disk and CPU. Visible in "
+           "services.msc."))
+def _set_service_startup(params: dict, dry_run: bool = False) -> ActionResult:
+    name = str(params.get("service") or "").strip()
+    wanted = str(params.get("startup") or "manual").strip().lower()
+    match = next((s for s in TUNABLE_SERVICES if s.lower() == name.lower()), "")
+    if not match:
+        return ActionResult(
+            False, f"{name!r} is not on the list of services this tool will "
+                   f"change. That list deliberately excludes security and "
+                   f"core Windows services.")
+    if wanted not in _START_VALUES:
+        return ActionResult(False, "Startup must be 'disabled', 'manual' or "
+                                   "'automatic'.")
+    was = service_start_type(match)
+    if not was:
+        return ActionResult(False, f"{match} is not installed on this machine.")
+    if was == wanted or (wanted == "auto" and was == "automatic"):
+        return ActionResult(True, f"{match} is already {was}.")
+    if dry_run:
+        return ActionResult(
+            True, f"Would set {match} from {was} to {wanted}"
+                  + (" and stop it now. " if wanted == "disabled" else ". ")
+                  + TUNABLE_SERVICES[match])
+    flag = {"disabled": "disabled", "manual": "demand", "demand": "demand",
+            "automatic": "auto", "auto": "auto"}[wanted]
+    command = f"/c sc config {match} start= {flag}"
+    if wanted == "disabled":
+        command += f" && sc stop {match}"
+    code, output = _run_elevated("cmd.exe", command)
+    # `sc stop` returns non-zero when the service was not running, which is
+    # not a failure of what was asked for.
+    ok = code == 0 or "1062" in output or "not been started" in output.lower()
+    if not ok:
+        return ActionResult(False, f"Could not change {match}.", output=output)
+    return ActionResult(
+        True, f"{match} set to {wanted} (was {was}).", changed=True,
+        output=output,
+        undo={"kind": "service_start", "name": match, "start": was})
+
+
+@action(ActionSpec(
+    id="disable_game_recording",
+    title="Turn off background game recording",
+    detail="Xbox Game Bar keeps a rolling recording buffer so that the last "
+           "thirty seconds can be saved. It hooks graphics and keeps a "
+           "capture path warm whether or not anything is being played, which "
+           "costs CPU, GPU and disk on a machine that never games. Needs no "
+           "administrator rights -- it is a per-user setting.",
+    category="tuneup", risk="low", reversible=True,
+    undo_hint="The previous registry values are recorded and restored.",
+    expect="Less background CPU and GPU use, particularly in full-screen "
+           "applications."))
+def _disable_game_recording(params: dict, dry_run: bool = False) -> ActionResult:
+    targets = [
+        (r"System\GameConfigStore", "GameDVR_Enabled"),
+        (r"Software\Microsoft\Windows\CurrentVersion\GameDVR",
+         "AppCaptureEnabled"),
+    ]
+    previous: list[dict] = []
+    already = True
+    for path, name in targets:
+        current = None
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0,
+                                winreg.KEY_READ) as key:
+                current, _kind = winreg.QueryValueEx(key, name)
+        except OSError:
+            pass
+        if current != 0:
+            already = False
+        previous.append({"path": path, "name": name, "value": current})
+    if already:
+        return ActionResult(True, "Background game recording is already off.")
+    if dry_run:
+        return ActionResult(True, "Would turn off Xbox Game Bar background "
+                                  "recording for this user account.")
+    for path, name in targets:
+        try:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0,
+                                    winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, name, 0, winreg.REG_DWORD, 0)
+        except OSError as error:
+            return ActionResult(False, f"Could not change it: {error}")
+    return ActionResult(True, "Background game recording turned off.",
+                        changed=True,
+                        undo={"kind": "hkcu_dwords", "values": previous})
+
+
+@action(ActionSpec(
+    id="retrim_volume",
+    title="Tell the SSD which blocks are free",
+    detail="Runs a TRIM pass over the volume: it sends the drive the list of "
+           "blocks Windows no longer needs, which is what lets the drive's "
+           "controller keep enough pre-erased space to write quickly. A drive "
+           "that has not been trimmed for a long time develops exactly the "
+           "symptoms of one that is wearing out. No file data is read or "
+           "written.",
+    category="disk", risk="low", needs_admin=True, reversible=True,
+    undo_hint="Nothing to undo -- this changes no data, only the drive's own "
+              "free-block map.",
+    params={"drive": "Drive letter, e.g. 'C'"},
+    expect="Write latency settles. Takes seconds to a few minutes."))
+def _retrim_volume(params: dict, dry_run: bool = False) -> ActionResult:
+    letter = str(params.get("drive") or "C").strip().rstrip(":").upper()[:1]
+    if not letter.isalpha():
+        return ActionResult(False, "Give a drive letter.")
+    if dry_run:
+        return ActionResult(True, f"Would run a TRIM pass over {letter}:. No "
+                                  f"file data is read or written.")
+    code, output = _run_elevated(
+        "powershell.exe",
+        f"-NoProfile -NonInteractive -Command \"Optimize-Volume "
+        f"-DriveLetter {letter} -ReTrim -Verbose\"")
+    return ActionResult(code == 0,
+                        f"TRIM pass over {letter}: finished." if code == 0
+                        else f"The TRIM pass over {letter}: did not complete.",
+                        changed=code == 0, output=output)
+
+
 # -------------------------------------------------------------------- undo
 
 def undo(record: dict) -> ActionResult:
@@ -882,6 +1252,56 @@ def undo(record: dict) -> ActionResult:
             f"-StartupType Automatic; Start-Service -Name {record['name']}\"")
         return ActionResult(code == 0, f"{record['name']} restored.",
                             changed=code == 0, output=output)
+    if kind == "service_start":
+        flag = {"automatic": "auto", "manual": "demand",
+                "disabled": "disabled"}.get(record.get("start", ""), "demand")
+        code, output = _run_elevated(
+            "cmd.exe", f"/c sc config {record['name']} start= {flag}"
+                       + (f" && sc start {record['name']}"
+                          if flag == "auto" else ""))
+        return ActionResult(code == 0,
+                            f"{record['name']} set back to "
+                            f"{record.get('start')}.",
+                            changed=code == 0, output=output)
+    if kind == "lpm":
+        parts = []
+        if record.get("ac", -1) >= 0:
+            parts.append(f"powercfg /setacvalueindex SCHEME_CURRENT "
+                         f"{_SUB_DISK} {_HIPM_DIPM} {record['ac']}")
+        if record.get("dc", -1) >= 0:
+            parts.append(f"powercfg /setdcvalueindex SCHEME_CURRENT "
+                         f"{_SUB_DISK} {_HIPM_DIPM} {record['dc']}")
+        if not parts:
+            return ActionResult(False, "No previous value was recorded.")
+        parts.append("powercfg /setactive SCHEME_CURRENT")
+        code, output = _run_elevated("cmd.exe", "/c " + " && ".join(parts))
+        return ActionResult(code == 0, "Link power management put back.",
+                            changed=code == 0, output=output)
+    if kind == "mmagent":
+        verb = ("Enable-MMAgent -mc" if record.get("enabled")
+                else "Disable-MMAgent -mc")
+        code, output = _run_elevated(
+            "powershell.exe",
+            "-NoProfile -NonInteractive -Command " + chr(34) + verb + chr(34))
+        return ActionResult(code == 0, "Memory compression put back.",
+                            changed=code == 0, output=output)
+    if kind == "hkcu_dwords":
+        for item in record.get("values", []):
+            try:
+                if item.get("value") is None:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                        item["path"], 0,
+                                        winreg.KEY_SET_VALUE) as key:
+                        winreg.DeleteValue(key, item["name"])
+                else:
+                    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
+                                            item["path"], 0,
+                                            winreg.KEY_SET_VALUE) as key:
+                        winreg.SetValueEx(key, item["name"], 0,
+                                          winreg.REG_DWORD, int(item["value"]))
+            except OSError as error:
+                return ActionResult(False, f"Could not restore it: {error}")
+        return ActionResult(True, "Previous settings restored.", changed=True)
     if record and "path" in record:
         path = Path(record["path"])
         try:
@@ -913,19 +1333,36 @@ def catalogue() -> list[dict]:
 #: worst a successful injection achieves is a useless suggestion.
 ALLOWED_BY_CATEGORY: dict[str, tuple[str, ...]] = {
     "disk": ("check_smart", "storage_driver_info", "chkdsk_scan",
-             "clear_temp_files", "run_disk_cleanup", "clear_thumbnail_cache"),
+             "clear_temp_files", "run_disk_cleanup", "clear_thumbnail_cache",
+             "retrim_volume", "set_link_power_management"),
     "hardware": ("check_smart", "storage_driver_info", "chkdsk_scan",
-                 "show_event_detail", "sfc_verify"),
+                 "show_event_detail", "sfc_verify",
+                 # The one automated thing that has ever fixed a storage
+                 # controller reset. Everything else in a hardware finding is
+                 # a diagnostic, and this stays reversible.
+                 "set_link_power_management"),
     "memory": ("unload_ollama_models", "restart_process", "set_wsl_memory_cap",
                "disable_sysmain", "clear_temp_files", "show_event_detail",
-               "create_restore_point"),
-    "cpu": ("restart_process", "set_power_plan", "show_event_detail"),
+               "create_restore_point", "set_memory_compression",
+               "set_service_startup"),
+    "cpu": ("restart_process", "set_power_plan", "show_event_detail",
+            "disable_game_recording"),
     "freeze": ("restart_process", "restart_explorer", "show_event_detail",
-               "check_smart", "storage_driver_info"),
+               "check_smart", "storage_driver_info",
+               "set_link_power_management"),
     "handles": ("restart_process", "restart_explorer",
                 "restart_audio_service"),
     "threads": ("restart_process", "restart_explorer"),
-    "startup": ("disable_startup_item", "create_restore_point"),
+    "startup": ("disable_startup_item", "create_restore_point",
+                "set_service_startup"),
+    # Headroom rather than faults: what the tune-up scan proposes. Everything
+    # here is reversible and records what it found first, because a change
+    # made to a working machine has to be walkable back.
+    "tuneup": ("set_service_startup", "disable_startup_item",
+               "disable_game_recording", "set_memory_compression",
+               "set_link_power_management", "set_power_plan", "retrim_volume",
+               "clear_temp_files", "run_disk_cleanup", "unload_ollama_models",
+               "create_restore_point"),
     "driver": ("storage_driver_info", "check_smart", "show_event_detail",
                "sfc_verify"),
     "security": (),          # never automate changes to security software
@@ -979,16 +1416,28 @@ def plan_from_model(chosen: list[dict],
 
 def apply(planned: PlannedAction, dry_run: bool = True) -> ActionResult:
     spec = planned.spec
+    feed = bridge()
     if spec.handler is None:
         return ActionResult(False, "That action has no implementation.")
     if spec.needs_admin and not is_admin() and not dry_run:
         # Not an error: the handler asks for elevation itself. This only warns
         # when a handler cannot.
         pass
+    feed.emit("action.start", id=spec.id, dry_run=dry_run,
+              params=planned.params, risk=spec.risk,
+              needs_admin=spec.needs_admin, reason=planned.reason[:200])
+    started = time.perf_counter()
     try:
-        return spec.handler(planned.params, dry_run)
+        result = spec.handler(planned.params, dry_run)
     except Exception as error:
+        feed.emit("action.error", id=spec.id, dry_run=dry_run,
+                  error=f"{type(error).__name__}: {error}"[:200])
         return ActionResult(False, f"It failed: {error}")
+    feed.emit("action.done", id=spec.id, dry_run=dry_run, ok=result.ok,
+              changed=result.changed, message=result.message,
+              undoable=bool(result.undo),
+              duration_s=round(time.perf_counter() - started, 2))
+    return result
 
 
 def _check_registry() -> list[str]:

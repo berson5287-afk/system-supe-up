@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 
 import psutil
 
+from .bridge import bridge
 # Shapes only — the Windows implementation is reached through the backend,
 # so importing this module does not load ctypes.
 from .telemetry import HungWindow, ProcSnapshot, ThreadWaits, WaitChain
@@ -462,6 +463,85 @@ class Sampler:
                 row.gdi, row.user_objects = self._gui_cache[row.pid]
 
 
+#: How many samples pass between full pictures on the live feed. Every sample
+#: is still published as a one-line summary; this is the interval at which the
+#: heavier per-process detail is included, because 380 processes a second is
+#: not a feed anybody can read and is not free to serialise either.
+DETAIL_EVERY = 5
+
+
+def _publish(sample: Sample, count: int) -> None:
+    """Put one sample on the live bridge, if anything is listening.
+
+    Costs an attribute read and a return when the bridge is off, which is why
+    it can sit in the sampling path at all. When it is on, the cost is a JSON
+    dump onto a queue that another thread drains -- deliberately never a write,
+    because this function runs on the thread whose punctuality *is* the stall
+    measurement.
+    """
+    feed = bridge()
+    if not feed.enabled:
+        return
+
+    hot = sorted(sample.processes,
+                 key=lambda r: -(r.cpu + r.hard_faults / 20
+                                 + r.io_bps / 5e6))[:3]
+    feed.emit("sample",
+              n=count,
+              cpu=round(sample.cpu, 1),
+              mem_pct=round(sample.memory_percent, 1),
+              mem_free_gb=round(sample.memory_available / 1e9, 2),
+              commit_pct=round(sample.commit_percent, 1),
+              faults=round(sample.hard_faults),
+              disk_ms=round(sample.disk_latency_ms, 2),
+              disk_mbs=round((sample.disk_read_bps + sample.disk_write_bps) / 1e6, 1),
+              late=round(sample.lateness, 2),
+              ready=sample.ready_threads,
+              hung=len(sample.hung_windows),
+              procs=len(sample.processes),
+              gap=sample.discontinuity or None,
+              hot=[f"{r.name} {r.cpu:.0f}%" for r in hot if r.cpu >= 1.0])
+
+    if count % DETAIL_EVERY:
+        return
+    feed.state({
+        "at": sample.at,
+        "samples": count,
+        "machine": {
+            "cpu": round(sample.cpu, 1),
+            "memory_percent": round(sample.memory_percent, 1),
+            "memory_available_gb": round(sample.memory_available / 1e9, 2),
+            "memory_total_gb": round(sample.memory_total / 1e9, 2),
+            "commit_percent": round(sample.commit_percent, 1),
+            "commit_gb": round(sample.commit_total / 1e9, 2),
+            "commit_limit_gb": round(sample.commit_limit / 1e9, 2),
+            "hard_faults_per_s": round(sample.hard_faults),
+            "disk_latency_ms": round(sample.disk_latency_ms, 2),
+            "disk_read_mbs": round(sample.disk_read_bps / 1e6, 1),
+            "disk_write_mbs": round(sample.disk_write_bps / 1e6, 1),
+            "context_switches_per_s": round(sample.context_switches),
+            "ready_threads": sample.ready_threads,
+            "lateness_s": round(sample.lateness, 2),
+            "processes": len(sample.processes),
+        },
+        "top_memory": [
+            {"name": r.name, "pid": r.pid, "mb": round(r.memory / 1e6),
+             "private_mb": round(r.private / 1e6), "cpu": round(r.cpu, 1),
+             "threads": r.threads, "handles": r.handles,
+             "faults_per_s": round(r.hard_faults)}
+            for r in sample.by_memory(10)],
+        "top_cpu": [
+            {"name": r.name, "pid": r.pid, "cpu": round(r.cpu, 1),
+             "kernel": round(r.cpu_kernel, 1), "threads": r.threads}
+            for r in sample.by_cpu(6) if r.cpu >= 0.5],
+        "top_faults": [
+            {"name": r.name, "pid": r.pid, "faults_per_s": round(r.hard_faults)}
+            for r in sample.by_faults(6) if r.hard_faults >= 1],
+        "hung_windows": [{"pid": w.pid, "title": w.title}
+                         for w in sample.hung_windows],
+    })
+
+
 class History:
     """A ring buffer of samples, plus the stalls seen along the way.
 
@@ -509,6 +589,10 @@ class History:
     def add(self, sample: Sample, threshold: float = 2.5) -> dict | None:
         with self._lock:
             self._samples.append(sample)
+            count = len(self._samples)
+        # Every interface funnels its samples through here, so this is the one
+        # place that sees the live feed regardless of which one is running.
+        _publish(sample, count)
         # A pause or a sleep is not a freeze. `discontinuity` marks a gap we
         # were not watching across, and its lateness is meaningless.
         if sample.discontinuity or sample.lateness < threshold:
@@ -535,6 +619,13 @@ class History:
         }
         with self._lock:
             self._stalls.append(stall)
+        bridge().emit("stall", lateness=round(sample.lateness, 2),
+                      cpu=round(sample.cpu, 1),
+                      memory_percent=round(sample.memory_percent, 1),
+                      disk_latency_ms=round(sample.disk_latency_ms, 1),
+                      hard_faults=round(sample.hard_faults),
+                      suspects=[s["name"] for s in stall["suspects"][:4]],
+                      hung=[w["title"] for w in stall["hung_windows"][:3]])
         return stall
 
     def latest(self) -> Sample | None:

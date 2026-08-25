@@ -28,6 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from . import actions as actions_mod
+from .bridge import bridge
 from .config import Settings
 from .llm import Ollama
 from .research import Researcher, Source
@@ -181,7 +182,8 @@ def _build_queries(finding: Finding, facts: MachineFacts | None,
         f"Process: {finding.process or 'n/a'}\n"
         f"Evidence:\n{evidence}\n\n"
         f"JSON array of search queries:",
-        cancel=cancel, temperature=0.3, num_ctx=8192, num_predict=250)
+        cancel=cancel, temperature=0.3, num_ctx=8192, num_predict=250,
+        purpose=f"search queries: {finding.id}")
     parsed = _extract_json(answer)
     if isinstance(parsed, list):
         queries = [str(q).strip() for q in parsed
@@ -286,8 +288,14 @@ def investigate(finding: Finding, settings: Settings,
                         "built-in remedies are still shown.")
         return result
 
+    feed = bridge()
+    feed.emit("investigate.begin", finding=finding.id, title=finding.title,
+              category=finding.category, severity=finding.severity)
+
     say("working out what to search for")
     result.queries = _build_queries(finding, facts, client, settings, cancel)
+    feed.emit("investigate.queries", finding=finding.id,
+              queries=result.queries)
 
     if settings.get("research", True) and settings.get("searxng_url"):
         researcher = Researcher(
@@ -296,8 +304,14 @@ def investigate(finding: Finding, settings: Settings,
         if researcher.configured:
             try:
                 result.sources = _gather(researcher, result.queries, say)
-            except Exception:
+            except Exception as error:
+                feed.emit("investigate.research_failed", finding=finding.id,
+                          error=f"{type(error).__name__}: {error}"[:160])
                 result.sources = []
+            feed.emit("investigate.sources", finding=finding.id,
+                      count=len(result.sources),
+                      read=sum(1 for s in result.sources if s.body),
+                      domains=[s.domain for s in result.sources])
     if cancel is not None and cancel.is_set():
         return result
 
@@ -319,6 +333,8 @@ def investigate(finding: Finding, settings: Settings,
     # untrusted input; this is what stops a hostile page talking the planner
     # into a real-but-unrelated action.
     permitted = actions_mod.allowed_ids(finding.category)
+    feed.emit("investigate.permitted", finding=finding.id,
+              category=finding.category, ids=list(permitted))
 
     prompt = f"MACHINE\n{machine or 'Windows PC'}\n\n"
     if context:
@@ -351,11 +367,14 @@ def investigate(finding: Finding, settings: Settings,
         [{"role": "system", "content": ANALYSE_SYSTEM},
          {"role": "user", "content": prompt}],
         cancel=cancel, temperature=0.15,
-        num_ctx=int(settings.get("max_context_window", 32768)))
+        num_ctx=int(settings.get("max_context_window", 32768)),
+        purpose=f"plan: {finding.id}")
     result.model = client.active_url and str(settings.get("diagnose_model", ""))
 
     parsed = _extract_json(answer)
     if not isinstance(parsed, dict):
+        feed.emit("investigate.unparsed", finding=finding.id,
+                  chars=len(answer or ""), head=(answer or "")[:300])
         # A model that would not produce JSON has still usually said something
         # useful; keeping its prose beats showing the user an error.
         result.analysis = (answer or "").strip()
@@ -374,6 +393,17 @@ def investigate(finding: Finding, settings: Settings,
     chosen = parsed.get("actions")
     result.plan = actions_mod.plan_from_model(
         chosen if isinstance(chosen, list) else [], allowed=permitted)
+
+    proposed = [str(item.get("id")) for item in chosen
+                if isinstance(item, dict)] if isinstance(chosen, list) else []
+    feed.emit("investigate.plan", finding=finding.id,
+              confidence=result.confidence,
+              proposed=proposed,
+              accepted=[p.spec.id for p in result.plan],
+              discarded=[i for i in proposed
+                         if i not in {p.spec.id for p in result.plan}],
+              manual_steps=result.manual_steps,
+              root_cause=result.analysis[:600])
 
     dropped = (len(chosen) if isinstance(chosen, list) else 0) - len(result.plan)
     if dropped > 0:

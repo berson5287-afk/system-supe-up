@@ -26,6 +26,9 @@ import webbrowser
 from dataclasses import dataclass
 from tkinter import messagebox, ttk
 
+from . import bridge as bridge_mod
+from . import elevate as elevate_mod
+from . import window_state
 from . import diagnose as diagnose_mod, knowledge, report as report_mod, rules
 from .collect import History, ProcRow, Sample, Sampler
 from .incidents import IncidentRecorder
@@ -251,11 +254,14 @@ class App(tk.Tk):
         self._ticks = 0
         self._sort_column = "cpu"
         self._sort_reverse = True
+        self._admin_dismissed = False
 
         self.title("System Supe-Up")
         self.configure(bg=BG)
-        self.geometry("1300x860")
         self.minsize(1060, 680)
+        # Where it was last time, if that place still exists on this desk.
+        window_state.remember(self, "main", default="1300x860",
+                              minimum=(1060, 680))
 
         self._style()
         self._build()
@@ -264,6 +270,7 @@ class App(tk.Tk):
         self.sampler.start()
 
         self.protocol("WM_DELETE_WINDOW", self._quit)
+        self._refresh_admin_strip()
         self.after(120, self._drain)
 
     # ------------------------------------------------------------- chrome
@@ -289,6 +296,12 @@ class App(tk.Tk):
     def _build(self) -> None:
         self._build_header()
         self._build_gauges()
+
+        # Says what this copy cannot see or do, and offers the one button
+        # that changes it. Shown once, quietly, rather than raised as a dialog
+        # at startup: being asked for administrator rights before the tool has
+        # shown you anything is how people learn to click Yes without reading.
+        self._build_admin_strip()
 
         # The alert strip is packed and unpacked rather than always present,
         # so a healthy machine shows no empty red box waiting for trouble.
@@ -319,12 +332,21 @@ class App(tk.Tk):
         self.status_label = tk.Label(left, text="starting…", bg=BG, fg=DIM,
                                      font=FONT_SMALL)
         self.status_label.pack(side="left")
+        # Which rights this copy holds is a fact about every reading it takes,
+        # so it belongs next to the status light rather than buried in a menu.
+        tk.Label(left,
+                 text=("· administrator" if elevate_mod.is_admin()
+                       else "· standard rights"),
+                 bg=BG, fg=(ACCENT if elevate_mod.is_admin() else FAINT),
+                 font=FONT_SMALL).pack(side="left", padx=(8, 0))
 
         right = tk.Frame(bar, bg=BG)
         right.pack(side="right")
         self.diagnose_button = flat_button(
             right, "Diagnose now", self._diagnose, primary=True)
         self.diagnose_button.pack(side="left", padx=(0, 6))
+        self.tuneup_button = flat_button(right, "Tune-up", self._tuneup)
+        self.tuneup_button.pack(side="left", padx=(0, 6))
         flat_button(right, "Snapshot", self._snapshot).pack(side="left",
                                                            padx=(0, 6))
         flat_button(right, "Reports", self._open_reports).pack(side="left",
@@ -334,6 +356,83 @@ class App(tk.Tk):
         self.pause_button = flat_button(right, "Pause", self._toggle_pause)
         self.pause_button.pack(side="left", padx=(0, 6))
         flat_button(right, "⚙", self._open_settings).pack(side="left")
+
+    def _build_admin_strip(self) -> None:
+        """The one-line "you are not an administrator" bar, and its button."""
+        self.admin_strip = tk.Frame(self, bg="#1d2433",
+                                    highlightbackground=ACCENT_DARK,
+                                    highlightthickness=1)
+        text = tk.Frame(self.admin_strip, bg="#1d2433")
+        text.pack(side="left", fill="x", expand=True, padx=14, pady=8)
+        tk.Label(text, text="Running without administrator rights",
+                 bg="#1d2433", fg=TEXT, font=FONT_BOLD,
+                 anchor="w").pack(anchor="w")
+        tk.Label(text,
+                 text="Limited: " + "; ".join(
+                     item.split(" (")[0] for item in elevate_mod.RESTRICTED),
+                 bg="#1d2433", fg=DIM, font=FONT_SMALL, anchor="w",
+                 justify="left", wraplength=980).pack(anchor="w")
+
+        buttons = tk.Frame(self.admin_strip, bg="#1d2433")
+        buttons.pack(side="right", padx=(0, 12))
+        flat_button(buttons, "Restart as administrator",
+                    self._restart_as_admin, primary=True).pack(side="left",
+                                                               padx=(0, 6))
+        flat_button(buttons, "Not now", self._dismiss_admin_strip).pack(
+            side="left")
+
+    def _refresh_admin_strip(self) -> None:
+        """Show the strip only when it is both true and wanted."""
+        show = (not elevate_mod.is_admin()
+                and elevate_mod.mode(self.settings) != "never"
+                and not self._admin_dismissed)
+        mapped = self.admin_strip.winfo_ismapped()
+        if show and not mapped:
+            self.admin_strip.pack(fill="x", padx=12, pady=(0, 4),
+                                  after=self.gauge_frame)
+        elif not show and mapped:
+            self.admin_strip.pack_forget()
+
+    def _dismiss_admin_strip(self) -> None:
+        self._admin_dismissed = True
+        self._refresh_admin_strip()
+
+    def _restart_as_admin(self) -> None:
+        """Close this copy and open an elevated one, if the user agrees.
+
+        Everything sampled so far is in memory only, so this is not a free
+        action and is not presented as one.
+        """
+        if elevate_mod.is_admin():
+            messagebox.showinfo("System Supe-Up",
+                                "This is already running as administrator.")
+            return
+        minutes = max(0.0, (time.time() - self.started_at) / 60.0)
+        if not messagebox.askyesno(
+                "Restart as administrator",
+                "System Supe-Up will close and open again, and Windows will "
+                "ask you to approve it."
+                + "\n\n" +
+                f"The {minutes:.0f} minute(s) of samples collected so far are "
+                "held in memory and will be lost — reports already written "
+                "are not."
+                + "\n\n" +
+                "The elevated copy can read what a frozen program is waiting "
+                "on, and applies fixes without a separate prompt for each "
+                "one."
+                + "\n\n" + "Restart now?"):
+            return
+        started, why = elevate_mod.relaunch()
+        if not started:
+            messagebox.showwarning(
+                "System Supe-Up",
+                f"{why}"
+                + "\n\n" +
+                "Nothing has changed — this copy is still running, and "
+                "every fix will still ask for approval individually when it "
+                "needs it.")
+            return
+        self._quit()
 
     def _build_gauges(self) -> None:
         frame = tk.Frame(self, bg=PANEL, highlightbackground=BORDER,
@@ -516,7 +615,7 @@ class App(tk.Tk):
         window = tk.Toplevel(self)
         window.title("Freeze recorded")
         window.configure(bg=BG)
-        window.geometry("760x560")
+        window_state.remember(window, "incident", default="760x560")
 
         tk.Label(window, text=f"System stall — {incident.lateness:.2f} seconds",
                  bg=BG, fg=TEXT, font=FONT_TITLE, anchor="w").pack(
@@ -794,6 +893,7 @@ class App(tk.Tk):
         self.diagnose_button.configure(state="disabled" if busy else "normal")
         self.explain_button.configure(state="disabled" if busy else "normal")
         self.fix_button.configure(state="disabled" if busy else "normal")
+        self.tuneup_button.configure(state="disabled" if busy else "normal")
 
     def _diagnose(self) -> None:
         if self.busy:
@@ -836,7 +936,7 @@ class App(tk.Tk):
         window = tk.Toplevel(self)
         window.title("What is going on")
         window.configure(bg=BG)
-        window.geometry("820x680")
+        window_state.remember(window, "narrative", default="820x680")
 
         head = tk.Frame(window, bg=BG)
         head.pack(fill="x", padx=18, pady=(16, 8))
@@ -891,7 +991,7 @@ class App(tk.Tk):
         window = tk.Toplevel(self)
         window.title("What has been changed")
         window.configure(bg=BG)
-        window.geometry("880x620")
+        window_state.remember(window, "history", default="880x620")
 
         tk.Label(window, text="Action history", bg=BG, fg=TEXT,
                  font=FONT_TITLE, anchor="w").pack(fill="x", padx=18,
@@ -984,6 +1084,9 @@ class App(tk.Tk):
 
     def _settings_saved(self, settings: Settings) -> None:
         self.settings = settings
+        # Turning the admin question off (or back on) applies immediately;
+        # "Not now" is only for this session and is not overruled here.
+        self._refresh_admin_strip()
         # Sampling cadence is owned by the thread, so a changed interval only
         # takes effect on a restart of the app; say so rather than silently
         # ignoring it.
@@ -1076,6 +1179,74 @@ class App(tk.Tk):
         self.progress.configure(
             text=f"copied {len(commands)} command(s) to the clipboard")
 
+    def _tuneup(self) -> None:
+        """Scan for headroom rather than for faults, and offer the changes.
+
+        Deliberately a separate button from Diagnose. "Why did it freeze" and
+        "what would make this quicker" are different questions with different
+        answers, and folding the second into the first is how a monitor ends
+        up proposing to delete temporary files while the machine is four
+        gigabytes short of memory.
+        """
+        if self.busy:
+            return
+        self._set_busy(True, "scanning for what would help…")
+
+        def work() -> None:
+            try:
+                from . import optimise as optimise_mod
+                from . import sysinfo
+
+                def progress(message: str) -> None:
+                    self.after(0, lambda: self.progress.configure(
+                        text=f"⋯  {message}"))
+
+                facts = sysinfo.gather()
+                tuneup = optimise_mod.scan(self.history.latest(), facts,
+                                           on_progress=progress)
+            except Exception as error:
+                self.after(0, lambda: self._tuneup_failed(error))
+                return
+            self.after(0, lambda: self._tuneup_ready(tuneup, facts))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _tuneup_failed(self, error: Exception) -> None:
+        self._set_busy(False, "")
+        messagebox.showerror(
+            "System Supe-Up",
+            f"The tune-up scan did not finish:\n\n{error}")
+
+    def _tuneup_ready(self, tuneup, facts) -> None:
+        self._set_busy(False, f"{len(tuneup.opportunities)} thing(s) worth "
+                              f"changing")
+        if not tuneup.opportunities:
+            messagebox.showinfo(
+                "System Supe-Up",
+                "Nothing worth changing was found. That is a real result, not "
+                "a failure — this machine is configured about as well as it "
+                "can be for what it is being asked to do.")
+            return
+        from .fix_dialog import FixDialog
+        from . import optimise as optimise_mod
+
+        # Written before the dialog opens, so there is a shareable page even
+        # if nothing is applied. The two largest items on a managed machine
+        # are somebody else's decision to approve, and this is the page to
+        # send them.
+        try:
+            paths = report_mod.save_tuneup(tuneup, facts)
+            self.last_report = paths["html"]
+            self._set_busy(False, f"tune-up saved · {paths['html'].name}")
+        except Exception:
+            pass
+
+        finding, investigation = optimise_mod.as_investigation(
+            tuneup, self.history.latest())
+        FixDialog(self, finding, self.settings, facts=facts,
+                  sample=self.history.latest(),
+                  sampler=self.sampler.sampler, investigation=investigation)
+
     def _snapshot(self) -> None:
         if self.busy:
             return
@@ -1121,9 +1292,30 @@ class App(tk.Tk):
 
     def _quit(self) -> None:
         self.sampler.stopped.set()
+        window_state.save_now(self, "main")
         self.destroy()
 
 
 def main(settings: Settings | None = None) -> int:
-    App(settings or Settings.load()).mainloop()
+    settings = settings or Settings.load()
+    # `admin_mode: always` is the only path that elevates without being asked
+    # at the moment it happens, and it has to be turned on by hand. If Windows
+    # refuses or the prompt is declined, this carries on unelevated rather
+    # than failing to start -- a monitor that will not open is worse than one
+    # that cannot read wait chains.
+    if elevate_mod.should_elevate_at_startup(settings):
+        started, _why = elevate_mod.relaunch()
+        if started:
+            return 0
+    # Either the setting or the environment variable turns the live feed on,
+    # so it can be left on permanently for a machine under investigation
+    # without the app having to be started differently.
+    if settings.get("live_bridge", False):
+        bridge_mod.start()
+    else:
+        bridge_mod.start_if_requested()
+    try:
+        App(settings).mainloop()
+    finally:
+        bridge_mod.stop()
     return 0

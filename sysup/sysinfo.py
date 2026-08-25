@@ -258,6 +258,82 @@ def memory_slots(refresh: bool = False) -> MemorySlots:
     return slots
 
 
+#: Read once. Another WMI round trip, and physical disks do not change while
+#: the machine is running.
+_STORAGE_CACHE: "list[StorageDevice] | None" = None
+
+
+@dataclass
+class StorageDevice:
+    """One physical disk, and how it is attached.
+
+    The attachment is the part that matters here, and it is not cosmetic. A
+    "turn the SATA link power management off" remedy is correct on an AHCI
+    machine and meaningless on an NVMe one, and the two are indistinguishable
+    from the event log alone -- both report their errors through whichever
+    Intel driver is loaded. Reading the bus type is what stops the tune-up
+    proposing a setting that cannot do anything on this hardware.
+    """
+
+    name: str = ""
+    bus: str = ""            # NVMe, SATA, RAID, USB ...
+    media: str = ""          # SSD, HDD, Unspecified
+    size: int = 0
+
+    @property
+    def is_rotational(self) -> bool:
+        return self.media.upper() == "HDD"
+
+    @property
+    def is_ahci(self) -> bool:
+        """Attached over SATA, so the AHCI link power settings apply."""
+        return self.bus.upper() in ("SATA", "ATA", "ATAPI")
+
+    def describe(self) -> str:
+        parts = [self.name or "unnamed disk"]
+        if self.size:
+            parts.append(f"{self.size / 1e9:.0f} GB")
+        if self.media:
+            parts.append(self.media)
+        if self.bus:
+            parts.append(f"over {self.bus}")
+        return ", ".join(parts)
+
+
+def storage_devices(refresh: bool = False) -> list[StorageDevice]:
+    """The physical disks and how each is attached.  [] if it cannot be read."""
+    global _STORAGE_CACHE
+    if _STORAGE_CACHE is not None and not refresh:
+        return _STORAGE_CACHE
+
+    devices: list[StorageDevice] = []
+    script = ("Get-PhysicalDisk | ForEach-Object { "
+              "'{0}|{1}|{2}|{3}' -f $_.FriendlyName, $_.BusType, "
+              "$_.MediaType, $_.Size }")
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            encoding="utf-8", errors="replace")
+        output = completed.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        output = ""
+
+    for line in output.splitlines():
+        parts = line.strip().split("|")
+        if len(parts) < 4:
+            continue
+        try:
+            size = int(parts[3] or 0)
+        except ValueError:
+            size = 0
+        devices.append(StorageDevice(name=parts[0].strip(), bus=parts[1].strip(),
+                                     media=parts[2].strip(), size=size))
+    _STORAGE_CACHE = devices
+    return devices
+
+
 @dataclass
 class MachineFacts:
     os_name: str = ""

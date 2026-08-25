@@ -16,6 +16,8 @@ import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from . import elevate as elevate_mod
+from . import window_state
 from .config import CHAT_LAB_SETTINGS, Settings
 from .llm import Ollama
 from .research import Researcher
@@ -68,12 +70,14 @@ class SettingsDialog(tk.Toplevel):
         super().__init__(parent)
         self.settings = settings
         self.on_saved = on_saved
+        self.app = parent
         self._models: dict[str, list[str]] = {}
 
         self.title("Settings")
         self.configure(bg=BG)
-        self.geometry("760x760")
         self.minsize(700, 640)
+        window_state.remember(self, "settings", default="760x760",
+                              minimum=(700, 640))
         self.transient(parent)
 
         self._vars()
@@ -118,6 +122,7 @@ class SettingsDialog(tk.Toplevel):
             value=bool(get("confirm_every_action", True)))
         self.v_restore = tk.BooleanVar(
             value=bool(get("restore_point_first", True)))
+        self.v_admin = tk.StringVar(value=elevate_mod.mode(self.settings))
 
     # ------------------------------------------------------------- building
     def _build(self) -> None:
@@ -128,14 +133,35 @@ class SettingsDialog(tk.Toplevel):
         tk.Label(head, text=f"saved to {self.settings.path}", bg=BG, fg=FAINT,
                  font=FONT_TINY).pack(anchor="w")
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=22, pady=8)
+        # The settings run to six cards now, and the last of them is the one
+        # most likely to be looked for. Scrolling the body keeps the Save
+        # button on screen at any window height rather than pushing it off the
+        # bottom -- a dialog you cannot save is worse than one you must scroll.
+        holder = tk.Frame(self, bg=BG)
+        holder.pack(fill="both", expand=True, padx=(22, 10), pady=8)
+        canvas = tk.Canvas(holder, bg=BG, highlightthickness=0, bd=0)
+        scroll = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        body = tk.Frame(canvas, bg=BG)
+        body.bind("<Configure>", lambda _e: canvas.configure(
+            scrollregion=canvas.bbox("all")))
+        inner_id = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfigure(inner_id, width=e.width))
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y", padx=(8, 0))
+        self._scroller = canvas
+        # Bound on the dialog, not with bind_all: wheel events reach a
+        # toplevel through its children's bind tags anyway, and bind_all would
+        # scroll this canvas from every other window in the app.
+        self.bind("<MouseWheel>", self._on_wheel)
 
         self._servers_section(body)
         self._models_section(body)
         self._research_section(body)
         self._monitoring_section(body)
         self._safety_section(body)
+        self._admin_section(body)
 
         foot = tk.Frame(self, bg=BG)
         foot.pack(fill="x", padx=22, pady=(6, 18))
@@ -146,6 +172,19 @@ class SettingsDialog(tk.Toplevel):
         _button(foot, "Cancel", self.destroy).pack(side="right", padx=(0, 8))
         _button(foot, "Reset to inherited", self._reset).pack(side="right",
                                                               padx=(0, 8))
+        _button(foot, "Reset window sizes", self._reset_windows).pack(
+            side="right", padx=(0, 8))
+
+    def _on_wheel(self, event) -> None:
+        """Scroll the settings, unless the pointer is over something that has
+        its own idea of what the wheel means."""
+        widget = getattr(event, "widget", None)
+        if isinstance(widget, (ttk.Combobox, tk.Listbox, tk.Text)):
+            return
+        try:
+            self._scroller.yview_scroll(int(-event.delta / 120), "units")
+        except Exception:
+            pass
 
     def _card(self, parent, title: str, note: str = "") -> tk.Frame:
         card = tk.Frame(parent, bg=PANEL, highlightbackground=BORDER,
@@ -301,6 +340,68 @@ class SettingsDialog(tk.Toplevel):
             activebackground=PANEL, activeforeground=TEXT, font=FONT, bd=0,
             highlightthickness=0, cursor="hand2").pack(anchor="w", pady=(4, 0))
 
+    def _admin_section(self, parent) -> None:
+        """The elevation choice, stated as the trade it actually is."""
+        elevated = elevate_mod.is_admin()
+        inner = self._card(
+            parent, "Administrator rights",
+            "Fixes ask for elevation one at a time, which is why this is not "
+            "needed for most of what the tool does. Running the whole tool "
+            "elevated buys two things: readings Windows refuses to a standard "
+            "process, and one prompt instead of one per action.")
+
+        tk.Label(inner,
+                 text=("This copy is running as administrator."
+                       if elevated else
+                       "This copy is running with standard rights."),
+                 bg=PANEL, fg=(OK if elevated else TEXT),
+                 font=FONT_BOLD, anchor="w").pack(anchor="w")
+        for item in elevate_mod.RESTRICTED:
+            tk.Label(inner, text=("• " + item), bg=PANEL,
+                     fg=(FAINT if elevated else DIM), font=FONT_SMALL,
+                     wraplength=640, justify="left",
+                     anchor="w").pack(anchor="w", pady=(1, 0))
+
+        for value, label in (
+                ("ask", "Ask — say what is limited and offer a button "
+                        "(recommended)"),
+                ("always", "Always — request elevation every time it "
+                           "starts"),
+                ("never", "Never — do not mention it; each fix asks for "
+                          "itself")):
+            tk.Radiobutton(
+                inner, text=label, value=value, variable=self.v_admin,
+                bg=PANEL, fg=TEXT, selectcolor=PANEL_ALT,
+                activebackground=PANEL, activeforeground=TEXT, font=FONT,
+                bd=0, highlightthickness=0, cursor="hand2",
+                anchor="w").pack(anchor="w",
+                                 pady=(6 if value == "ask" else 0, 0))
+
+        row = tk.Frame(inner, bg=PANEL)
+        row.pack(fill="x", pady=(10, 0))
+        button = _button(row, "Restart as administrator now",
+                         self._restart_as_admin)
+        button.pack(side="left")
+        if elevated:
+            button.configure(state="disabled", text="Already an administrator")
+
+    def _restart_as_admin(self) -> None:
+        """Save first, then hand the restart to the window that owns the app.
+
+        Restarting with the settings unsaved would lose whatever is in this
+        dialog, and the elevated copy would come back with the old choice --
+        which looks exactly like the setting not working.
+        """
+        if not self._save():
+            return
+        restart = getattr(self.app, "_restart_as_admin", None)
+        if restart is None:
+            messagebox.showwarning(
+                "System Supe-Up",
+                "Close and reopen System Supe-Up to apply this.")
+            return
+        restart()
+
     # -------------------------------------------------------------- testing
     def _url(self, host_var: tk.StringVar, port_var: tk.StringVar) -> str:
         host = host_var.get().strip().rstrip("/")
@@ -390,6 +491,19 @@ class SettingsDialog(tk.Toplevel):
         threading.Thread(target=work, daemon=True).start()
 
     # --------------------------------------------------------------- saving
+    def _reset_windows(self) -> None:
+        """Every window back to the size it was designed at, next time.
+
+        Here because a window that ends up somewhere unreachable is the one
+        problem the user cannot fix from inside the app -- `window_state`
+        already refuses a position that is off every monitor, but a window
+        that is merely awkward is not something it can detect.
+        """
+        window_state.forget_all()
+        self.status.configure(
+            text="Window sizes and positions forgotten. Each window returns "
+                 "to its normal size the next time it opens.")
+
     def _reset(self) -> None:
         if not messagebox.askyesno(
                 "Reset", f"Clear the server addresses so they are inherited "
@@ -413,7 +527,8 @@ class SettingsDialog(tk.Toplevel):
             return default
         return max(low, min(high, value))
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
+        """True when the settings were actually written and this closed."""
         host = self._url(self.v_host, self.v_host_port)
         local = self._url(self.v_local, self.v_local_port)
         if not host and not local:
@@ -447,11 +562,21 @@ class SettingsDialog(tk.Toplevel):
             self.v_temp, float, 0.2, 0.0, 2.0)
         settings["confirm_every_action"] = bool(self.v_confirm.get())
         settings["restore_point_first"] = bool(self.v_restore.get())
+        settings["admin_mode"] = (self.v_admin.get()
+                                  if self.v_admin.get() in elevate_mod.MODES
+                                  else "ask")
 
         if not settings.save():
             messagebox.showerror("Settings", "Could not write the settings "
                                              "file.", parent=self)
-            return
+            return False
+        # A SearXNG that stopped answering is given up on for the session, so
+        # that a dead instance does not cost every later diagnosis a string of
+        # connect timeouts. Someone who has just been in here and changed the
+        # address has earned a fresh attempt.
+        from .research import reset_reachability
+        reset_reachability()
         if self.on_saved is not None:
             self.on_saved(settings)
         self.destroy()
+        return True

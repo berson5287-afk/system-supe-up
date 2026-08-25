@@ -18,9 +18,12 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from collections.abc import Callable, Iterable
 
 import requests
+
+from .bridge import bridge
 
 USER_AGENT = "SystemSupeUp/1.0"
 
@@ -116,12 +119,26 @@ class Ollama:
              temperature: float = 0.2,
              num_ctx: int = 16384,
              num_predict: int = -1,
-             think: bool | None = None) -> str:
-        """Stream a completion.  Returns "" rather than raising."""
+             think: bool | None = None,
+             purpose: str = "") -> str:
+        """Stream a completion.  Returns "" rather than raising.
+
+        `purpose` names what the call is for on the live bridge. It changes
+        nothing about the request; it is the difference between a feed that
+        says "a model was asked something" and one that says which stage of
+        the diagnosis is currently waiting on a 32B model.
+        """
+        feed = bridge()
         url, resolved = self.resolve(model)
         if not url:
+            feed.emit("llm.unreachable", purpose=purpose, wanted=model)
             return ""
         self.active_url = url
+        started = time.perf_counter()
+        feed.llm("llm.request", purpose=purpose, model=resolved, server=url,
+                 wanted=model, temperature=temperature, num_ctx=num_ctx,
+                 chars=sum(len(m.get("content", "")) for m in messages),
+                 messages=messages)
 
         payload = {
             "model": resolved,
@@ -139,7 +156,9 @@ class Ollama:
                 f"{url}/api/chat", json=payload, stream=True,
                 headers={"User-Agent": USER_AGENT},
                 timeout=(self.connect_timeout, self.timeout))
-        except requests.RequestException:
+        except requests.RequestException as error:
+            feed.emit("llm.failed", purpose=purpose, model=resolved,
+                      server=url, error=str(error)[:200])
             return ""
         if response.status_code >= 400:
             response.close()
@@ -148,7 +167,10 @@ class Ollama:
             # models reason.
             if think is not None:
                 return self.chat(model, messages, on_token, cancel,
-                                 temperature, num_ctx, num_predict, think=None)
+                                 temperature, num_ctx, num_predict, think=None,
+                                 purpose=purpose)
+            feed.emit("llm.failed", purpose=purpose, model=resolved,
+                      server=url, status=response.status_code)
             return ""
 
         chunks: list[str] = []
@@ -176,7 +198,16 @@ class Ollama:
         finally:
             response.close()
 
-        return strip_reasoning("".join(chunks))
+        raw = "".join(chunks)
+        answer = strip_reasoning(raw)
+        feed.llm("llm.response", purpose=purpose, model=resolved, server=url,
+                 duration_s=round(time.perf_counter() - started, 2),
+                 chars=len(answer), ok=bool(answer),
+                 # Kept apart because a model that answered entirely inside a
+                 # <think> block looks identical to one that said nothing, and
+                 # those need completely different fixes.
+                 reasoning_chars=len(raw) - len(answer), text=answer)
+        return answer
 
     def ask(self, model: str, system: str, user: str, **kwargs) -> str:
         return self.chat(model, [{"role": "system", "content": system},

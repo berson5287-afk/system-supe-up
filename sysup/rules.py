@@ -21,9 +21,11 @@ Every rule obeys three house rules:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from . import knowledge
+from .bridge import bridge
 from .collect import History, ProcRow, Sample
 from .knowledge import Fix
 
@@ -176,6 +178,10 @@ def analyse(history: History, sample: Sample | None = None) -> list[Finding]:
     if sample is None:
         return []
 
+    feed = bridge()
+    feed.emit("rules.begin", samples=history.count,
+              processes=len(sample.processes))
+
     findings: list[Finding] = []
     for rule in (_rule_hung_apps, _rule_memory_pressure, _rule_memory_verdict,
                  _rule_known_leak, _rule_paging_storm,
@@ -185,14 +191,29 @@ def analyse(history: History, sample: Sample | None = None) -> list[Finding]:
                  _rule_handle_leak, _rule_thread_explosion,
                  _rule_memory_leak, _rule_kernel_pool, _rule_cpu_starvation,
                  _rule_driver_waits):
+        name = rule.__name__.removeprefix("_rule_")
+        started = time.perf_counter()
         try:
-            findings.extend(rule(history, sample) or [])
-        except Exception:
+            produced = rule(history, sample) or []
+        except Exception as error:
             # A broken rule must not take the monitor down with it; the other
-            # fifteen still have something useful to say.
+            # seventeen still have something useful to say. It used to vanish
+            # entirely, though, which made a rule that had quietly started
+            # raising indistinguishable from one that simply never matched.
+            feed.emit("rule.error", rule=name,
+                      error=f"{type(error).__name__}: {error}")
             continue
+        findings.extend(produced)
+        feed.emit("rule", rule=name, fired=len(produced),
+                  ms=round((time.perf_counter() - started) * 1000, 2),
+                  findings=[{"id": f.id, "severity": f.severity,
+                             "confidence": round(f.confidence, 2),
+                             "title": f.title, "process": f.process}
+                            for f in produced])
 
     findings.sort(key=lambda f: f.sort_key())
+    feed.emit("rules.end", total=len(findings),
+              titles=[f.title for f in findings])
     return findings
 
 
@@ -850,12 +871,12 @@ def _rule_duplicate_antivirus(history: History, sample: Sample) -> list[Finding]
                 "agent your IT provider deployed — and uninstall the other "
                 "rather than merely disabling it. A disabled scanner often "
                 "leaves its filter driver loaded, which keeps most of the "
-                "cost.", risk="high", admin=True),
+                "cost.", risk="high", needs_admin=True),
             Fix("If both must stay, exclude each from the other",
                 "Add each product's install directory and processes to the "
                 "other's exclusion list. This recovers much of the loss "
                 "without changing what is deployed.",
-                risk="high", admin=True)])]
+                risk="high", needs_admin=True)])]
 
 
 def _rule_lock_contention(history: History, sample: Sample) -> list[Finding]:
@@ -1150,7 +1171,7 @@ def _rule_kernel_pool(history: History, sample: Sample) -> list[Finding]:
         fixes=[Fix("Find the leaking pool tag",
                    "Enable pool tagging and compare tags over time; the tag "
                    "that keeps growing identifies the driver.",
-                   "poolmon.exe", risk="medium", admin=True),
+                   "poolmon.exe", risk="medium", needs_admin=True),
                Fix("Reboot to clear it, then watch uptime",
                    "If the problem returns after a predictable number of days "
                    "of uptime, it is a leak rather than a load spike.",

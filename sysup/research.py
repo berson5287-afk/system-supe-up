@@ -22,6 +22,8 @@ from pathlib import Path
 
 import requests
 
+from .bridge import bridge
+
 USER_AGENT = "SystemSupeUp/1.0"
 CACHE_PATH = Path.home() / "SystemSupeUp" / "process-research.json"
 
@@ -202,6 +204,28 @@ class ProcessResearch:
         return "\n\n---\n\n".join(parts)
 
 
+#: SearXNG instances that have refused to connect, and how many times.
+#:
+#: Shared across every Researcher in the process on purpose. Each search that
+#: cannot reach the server costs a full connect timeout, and a diagnosis runs
+#: several of them -- so with the box switched off, every report took most of
+#: a minute longer than it needed to and reported nothing extra for the wait.
+#: After a couple of consecutive failures the instance is treated as absent
+#: for the rest of the session, which is the same state the tool is designed
+#: to work in when SearXNG was never configured at all.
+_UNREACHABLE: dict[str, int] = {}
+
+#: Consecutive connection failures before an instance is given up on.  Two
+#: rather than one, so a single dropped packet does not disable research for
+#: the session.
+GIVE_UP_AFTER = 2
+
+
+def reset_reachability() -> None:
+    """Forget which servers were unreachable -- after a settings change."""
+    _UNREACHABLE.clear()
+
+
 class Researcher:
     """SearXNG plus a disk cache, scoped to identifying processes."""
 
@@ -214,7 +238,30 @@ class Researcher:
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url)
+        """Is there a server worth asking?
+
+        False once the configured one has stopped answering, so callers stop
+        queueing searches behind a timeout that is going to expire. The rest
+        of the tool already handles "research is not available" -- that is the
+        offline case it was built for -- so this degrades rather than fails.
+        """
+        return bool(self.base_url) and not self.given_up
+
+    @property
+    def given_up(self) -> bool:
+        return _UNREACHABLE.get(self.base_url, 0) >= GIVE_UP_AFTER
+
+    def _failed_to_connect(self) -> None:
+        count = _UNREACHABLE.get(self.base_url, 0) + 1
+        _UNREACHABLE[self.base_url] = count
+        if count == GIVE_UP_AFTER:
+            bridge().emit(
+                "search.given_up", url=self.base_url, failures=count,
+                detail="research disabled for this session; findings and "
+                       "fixes are unaffected")
+
+    def _connected(self) -> None:
+        _UNREACHABLE.pop(self.base_url, None)
 
     # -- cache -------------------------------------------------------------
     def _load_cache(self) -> dict:
@@ -245,7 +292,14 @@ class Researcher:
 
     # -- search ------------------------------------------------------------
     def search(self, query: str, max_results: int = 6) -> list[Source]:
+        feed = bridge()
         if not self.base_url:
+            feed.emit("search.skipped", query=query, why="no searxng url")
+            return []
+        if self.given_up:
+            feed.emit("search.skipped", query=query,
+                      why=f"{self.base_url} did not answer earlier this "
+                          f"session")
             return []
         try:
             response = requests.get(
@@ -253,10 +307,21 @@ class Researcher:
                 params={"q": query, "format": "json", "safesearch": "1"},
                 headers={"User-Agent": USER_AGENT}, timeout=self.timeout)
             if response.status_code >= 400:
+                # Worth naming rather than swallowing: a SearXNG that has not
+                # enabled the JSON format answers 403 here, and the only
+                # symptom otherwise is research quietly never happening.
+                feed.emit("search.failed", query=query,
+                          status=response.status_code,
+                          body=response.text[:200])
                 return []
             payload = response.json()
-        except (requests.RequestException, ValueError):
+        except (requests.RequestException, ValueError) as error:
+            feed.emit("search.failed", query=query,
+                      error=f"{type(error).__name__}: {error}"[:200])
+            if isinstance(error, (requests.ConnectionError, requests.Timeout)):
+                self._failed_to_connect()
             return []
+        self._connected()
 
         sources = []
         for item in payload.get("results", []):
@@ -281,7 +346,10 @@ class Researcher:
         # "microsoft.com.attacker.net" is promoted to the top of the list.
         sources.sort(key=lambda s: 0 if any(
             host_matches(s.domain, t) for t in TRUSTED_DOMAINS) else 1)
-        return sources[:max_results]
+        kept = sources[:max_results]
+        feed.emit("search", query=query, returned=len(payload.get("results", [])),
+                  kept=len(kept), domains=[s.domain for s in kept])
+        return kept
 
     @staticmethod
     def _relevant(source: Source, process_name: str) -> bool:
@@ -330,8 +398,11 @@ class Researcher:
             if "html" not in response.headers.get("Content-Type", ""):
                 return ""
             text = html_to_text(response.text[:500_000])
-        except requests.RequestException:
+        except requests.RequestException as error:
+            bridge().emit("fetch.failed", url=url,
+                          error=f"{type(error).__name__}: {error}"[:160])
             return ""
+        bridge().emit("fetch", url=url, chars=len(text[:PAGE_CHAR_LIMIT]))
         return text[:PAGE_CHAR_LIMIT]
 
     def identify(self, process_name: str, read_pages: int = 2,

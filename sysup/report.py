@@ -9,6 +9,7 @@ at the last possible moment, after all the work is done.
 from __future__ import annotations
 
 import html
+import re
 import time
 from pathlib import Path
 
@@ -395,5 +396,220 @@ def save(diagnosis: Diagnosis, directory: Path | None = None) -> dict[str, Path]
 
     html_path = directory / f"{stem}.html"
     html_path.write_text(to_html(diagnosis), encoding="utf-8")
+    written["html"] = html_path
+    return written
+
+
+# ---------------------------------------------------------------- tune-up
+
+_INLINE = (
+    (re.compile(r"`([^`]+)`"), r"<code>\1</code>"),
+    (re.compile(r"\*\*([^*]+)\*\*"), r"<strong>\1</strong>"),
+    (re.compile(r"\*([^*]+)\*"), r"<em>\1</em>"),
+)
+
+
+def _inline(text: str) -> str:
+    """Escape, then re-apply the handful of inline marks this report uses.
+
+    Deliberately tiny.  Nothing here renders arbitrary Markdown -- it renders
+    the Markdown `tuneup_to_markdown` writes, which is a closed set, and
+    everything is HTML-escaped before any mark is applied so that a process
+    name containing angle brackets cannot become an element.
+    """
+    out = html.escape(text)
+    for pattern, replacement in _INLINE:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def _markdown_page(title: str, markdown: str) -> str:
+    """Wrap the tune-up's own Markdown in the same stylesheet as the report."""
+    body: list[str] = []
+    in_list = False
+    in_table = False
+
+    def close() -> None:
+        nonlocal in_list, in_table
+        if in_list:
+            body.append("</ul>")
+            in_list = False
+        if in_table:
+            body.append("</table>")
+            in_table = False
+
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            close()
+            continue
+        if stripped.startswith("|"):
+            cells = [c.strip() for c in stripped.strip("|").split("|")]
+            if all(set(c) <= set("-: ") for c in cells):
+                continue        # the header underline
+            if not in_table:
+                close()
+                body.append('<table class="rows">')
+                in_table = True
+                tag = "th"
+            else:
+                tag = "td"
+            body.append("<tr>" + "".join(f"<{tag}>{_inline(c)}</{tag}>"
+                                         for c in cells) + "</tr>")
+            continue
+        if stripped.startswith("- "):
+            if not in_list:
+                close()
+                body.append("<ul>")
+                in_list = True
+            body.append(f"<li>{_inline(stripped[2:])}</li>")
+            continue
+        close()
+        if stripped.startswith("### "):
+            body.append(f"<h3>{_inline(stripped[4:])}</h3>")
+        elif stripped.startswith("## "):
+            body.append(f"<h2>{_inline(stripped[3:])}</h2>")
+        elif stripped.startswith("# "):
+            body.append(f"<h1>{_inline(stripped[2:])}</h1>")
+        elif stripped.startswith("> "):
+            body.append(f'<div class="headline">{_inline(stripped[2:])}</div>')
+        elif stripped == "---":
+            body.append("<hr>")
+        else:
+            body.append(f"<p>{_inline(stripped)}</p>")
+    close()
+
+    return "\n".join([
+        "<!doctype html>", '<html lang="en"><head>', '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        f"<title>{html.escape(title)}</title>",
+        f"<style>{_CSS}</style>", "</head><body>", *body,
+        "</body></html>"])
+
+
+def tuneup_to_markdown(tuneup, facts=None) -> str:
+    """The tune-up as a document, ordered by what is worth doing first.
+
+    Written separately from the diagnosis rather than folded into it because
+    the two answer different questions and are read by different people. The
+    largest items on a managed machine -- fit more memory, remove two of the
+    three antivirus products -- are somebody else's decision to approve, and
+    this is the page to send them: every claim carries the measurement it was
+    made from, so it can be argued with rather than merely believed.
+    """
+    out: list[str] = ["# System Supe-Up — tune-up"]
+    out.append(f"\n*{_stamp(tuneup.at)}"
+               + (f" · {facts.computer}" if facts and facts.computer else "")
+               + "*\n")
+
+    if not tuneup.opportunities:
+        out.append("Nothing worth changing was found. That is a result rather "
+                   "than a failure: this machine is configured about as well "
+                   "as it can be for what it is being asked to do.\n")
+        return "\n".join(out)
+
+    automatable = tuneup.automatable
+    out.append(f"> **{tuneup.headline()}**\n>\n"
+               f"> {len(tuneup.opportunities)} thing(s) worth changing. "
+               f"{len(automatable)} can be done from this tool with a preview "
+               f"and an undo; {len(tuneup.manual)} need a person.\n")
+
+    if facts:
+        out.append("## The machine\n")
+        out.append("| | |\n|---|---|")
+        out.append(f"| Operating system | {facts.os_build} |")
+        out.append(f"| Processor | {facts.cpu_model} "
+                   f"({facts.cpu_cores}C/{facts.cpu_threads}T) |")
+        out.append(f"| Memory | {facts.ram_total / 1e9:.1f} GB |")
+        out.append(f"| Uptime | {facts.uptime_days:.1f} days |")
+        out.append("")
+
+    out.append("## What to do, in order\n")
+    out.append("| # | Gain | Effort | What | How |")
+    out.append("|---|---|---|---|---|")
+    for number, opportunity in enumerate(tuneup.opportunities, 1):
+        how = (f"`{opportunity.action_id}`" if opportunity.automatable
+               else "by hand")
+        out.append(f"| {number} | {opportunity.gain_label} | "
+                   f"{opportunity.effort} | {opportunity.title} | {how} |")
+    out.append("")
+
+    for number, opportunity in enumerate(tuneup.opportunities, 1):
+        out.append(f"### {number}. {opportunity.title}\n")
+        out.append(f"*{opportunity.gain_label} gain · {opportunity.effort} · "
+                   f"{opportunity.category}*\n")
+        out.append(opportunity.detail + "\n")
+        if opportunity.evidence:
+            out.append("**Measured**\n")
+            out += [f"- {item}" for item in opportunity.evidence if item]
+            out.append("")
+        if opportunity.automatable:
+            spec = None
+            try:
+                from .actions import REGISTRY
+                spec = REGISTRY.get(opportunity.action_id)
+            except Exception:
+                spec = None
+            flags = []
+            if spec is not None:
+                flags.append(f"{spec.risk} risk")
+                if spec.needs_admin:
+                    flags.append("needs administrator")
+                flags.append("reversible" if spec.reversible
+                             else "NOT reversible")
+            out.append(f"**This tool can do it** — `{opportunity.action_id}`"
+                       + (f" ({', '.join(flags)})" if flags else "")
+                       + ". Previewed in dry-run first, and confirmed "
+                         "individually.\n")
+        for step in opportunity.manual_steps:
+            out.append(f"- {step}")
+        if opportunity.manual_steps:
+            out.append("")
+        if opportunity.verify:
+            out.append(f"**You will know it worked by:** {opportunity.verify}\n")
+
+    # A report that does not say which rights produced it invites the reader
+    # to treat "nothing found" as "nothing there", which is the one thing a
+    # standard-rights scan cannot promise.
+    try:
+        from .elevate import RESTRICTED, is_admin
+        if not is_admin():
+            out.append("## Read with standard rights\n")
+            out.append("This scan ran without administrator rights, so the "
+                       "following were out of reach:\n")
+            out += [f"- {item}" for item in RESTRICTED]
+            out.append("")
+    except Exception:
+        pass
+
+    if tuneup.unavailable:
+        out.append("## Not checked\n")
+        out.append("These readings were refused, so they are unknown rather "
+                   "than clean:\n")
+        out += [f"- {item}" for item in tuneup.unavailable]
+        out.append("")
+
+    out.append("---\n")
+    out.append("*Nothing in this document has been applied. Every automated "
+               "step is previewed in dry-run, approved individually, and "
+               "recorded with enough detail to be reversed.*")
+    return "\n".join(out)
+
+
+def save_tuneup(tuneup, facts=None, directory=None) -> dict:
+    """Write the tune-up as Markdown and HTML.  Returns the paths."""
+    directory = Path(directory) if directory else REPORT_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    stem = f"tuneup-{_slug(tuneup.at)}"
+    markdown = tuneup_to_markdown(tuneup, facts)
+
+    written = {}
+    markdown_path = directory / f"{stem}.md"
+    markdown_path.write_text(markdown, encoding="utf-8")
+    written["markdown"] = markdown_path
+
+    html_path = directory / f"{stem}.html"
+    html_path.write_text(_markdown_page("System Supe-Up — tune-up", markdown),
+                         encoding="utf-8")
     written["html"] = html_path
     return written

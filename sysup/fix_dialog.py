@@ -21,6 +21,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from . import actions as actions_mod, investigate as investigate_mod
+from . import elevate as elevate_mod
+from . import window_state
 from .config import Settings
 from .journal import Journal, capture_state, verify
 from .rules import Finding
@@ -62,9 +64,17 @@ def _button(parent, text, command, primary=False, **kwargs):
 
 class FixDialog(tk.Toplevel):
     def __init__(self, parent, finding: Finding, settings: Settings,
-                 facts=None, sample=None, sampler=None) -> None:
+                 facts=None, sample=None, sampler=None,
+                 investigation=None) -> None:
         super().__init__(parent)
+        self.app = parent
         self.finding = finding
+        # A caller that already has a plan -- the tune-up scan builds one from
+        # measured state rather than from the model -- hands it in here and
+        # the research step is skipped. Everything after it is identical, and
+        # deliberately so: preview, individual approval, restore point, undo
+        # written to disk before anything runs.
+        self._ready = investigation
         self.settings = settings
         self.facts = facts
         self.sample = sample
@@ -78,10 +88,12 @@ class FixDialog(tk.Toplevel):
         self._applying = False
         self._undo_stack: list[tuple[str, dict]] = []
 
-        self.title(f"Investigate — {finding.title[:60]}")
+        self.title(("Tune-up — " if investigation is not None
+                    else "Investigate — ") + finding.title[:60])
         self.configure(bg=BG)
-        self.geometry("900x800")
         self.minsize(760, 620)
+        window_state.remember(self, "fix", default="900x800",
+                              minimum=(760, 620))
         self.transient(parent)
         self.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -104,6 +116,19 @@ class FixDialog(tk.Toplevel):
         self.progress = tk.Label(self, text="", bg=BG, fg=ACCENT,
                                  font=FONT_SMALL, anchor="w")
         self.progress.pack(fill="x", padx=20, pady=(2, 6))
+
+        # Populated once the plan is known: how many of these steps will
+        # stop and ask Windows for approval, one at a time. Packed only when
+        # that number is not zero.
+        self.admin_note = tk.Frame(self, bg="#1d2433",
+                                   highlightbackground=ACCENT_DARK,
+                                   highlightthickness=1)
+        self.admin_note_label = tk.Label(
+            self.admin_note, text="", bg="#1d2433", fg=TEXT, font=FONT_SMALL,
+            anchor="w", justify="left", wraplength=620, padx=12, pady=8)
+        self.admin_note_label.pack(side="left", fill="x", expand=True)
+        _button(self.admin_note, "Restart as administrator",
+                self._restart_as_admin).pack(side="right", padx=(0, 10))
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=20)
@@ -164,6 +189,9 @@ class FixDialog(tk.Toplevel):
 
     # ---------------------------------------------------------- researching
     def _start(self) -> None:
+        if self._ready is not None:
+            self.after(0, lambda: self._investigated(self._ready))
+            return
         context = investigate_mod.live_context(self.sample)
 
         def work() -> None:
@@ -240,6 +268,7 @@ class FixDialog(tk.Toplevel):
             return
 
         self.plan_label.configure(text=f"PROPOSED STEPS ({len(plan)})")
+        self._refresh_admin_note(plan)
         self.status.configure(text="previewing…")
         for planned in plan:
             self._plan_row(planned)
@@ -296,6 +325,54 @@ class FixDialog(tk.Toplevel):
         self.rows.append((planned, variable))
         planned._preview_widget = preview       # type: ignore[attr-defined]
         planned._result_widget = result         # type: ignore[attr-defined]
+
+    def _refresh_admin_note(self, plan: list[actions_mod.PlannedAction]) -> None:
+        """Say up front how many prompts approving this plan will cost.
+
+        Finding this out one UAC dialog at a time, halfway through a plan, is
+        how somebody ends up clicking Yes on the eighth one without reading
+        it.
+        """
+        needing = [p for p in plan if p.spec.needs_admin]
+        if (not needing or elevate_mod.is_admin()
+                or elevate_mod.mode(self.settings) == "never"):
+            if self.admin_note.winfo_ismapped():
+                self.admin_note.pack_forget()
+            return
+        self.admin_note_label.configure(
+            text=(f"{len(needing)} of these {len(plan)} steps need "
+                  f"administrator rights. Each one will raise its own Windows "
+                  f"approval prompt as it runs. Restarting as administrator "
+                  f"asks once instead — but it closes this window, and "
+                  f"the scan behind it has to be run again."))
+        self.admin_note.pack(fill="x", padx=20, pady=(0, 6),
+                             after=self.progress)
+
+    def _restart_as_admin(self) -> None:
+        """Hand the restart to the main window, once the cost is agreed."""
+        if self._applying:
+            messagebox.showinfo(
+                "System Supe-Up",
+                "Steps are running. Let them finish first.", parent=self)
+            return
+        if not messagebox.askyesno(
+                "Restart as administrator",
+                "This window closes and System Supe-Up starts again with "
+                "administrator rights."
+                + "\n\n" +
+                "Nothing here has been applied, and the scan that produced "
+                "this plan will need running again in the new copy."
+                + "\n\n" + "Restart now?", parent=self):
+            return
+        restart = getattr(self.app, "_restart_as_admin", None)
+        if restart is None:
+            messagebox.showwarning(
+                "System Supe-Up",
+                "Close System Supe-Up and reopen it as administrator.",
+                parent=self)
+            return
+        self._close()
+        restart()
 
     def _preview_all(self) -> None:
         def work() -> None:

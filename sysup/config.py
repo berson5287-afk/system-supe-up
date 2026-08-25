@@ -55,10 +55,26 @@ DEFAULTS: dict[str, Any] = {
     # confirmed individually at the moment it runs, rather than the whole plan
     # being approved once.
     "confirm_every_action": True,
+    # Whether the tool may run as administrator, and when it says so.
+    # "ask"    -- say what is limited and offer a button; never elevate alone.
+    # "always" -- relaunch elevated at startup, so nothing has to ask again.
+    # "never"  -- do not mention it; every fix asks for its own elevation.
+    # Default is "ask" deliberately: a process that samples every process on
+    # the machine every second is a different thing to trust when it also
+    # holds administrator rights all day, and that trade is the user's to
+    # make rather than this file's. See elevate.py.
+    "admin_mode": "ask",
+
     # Offer a restore point before the first action that is not trivially
     # reversible. Costs a few seconds and is the difference between a change
     # that can be walked back and one that cannot.
     "restore_point_first": True,
+
+    # Stream every stage -- samples, rules, model prompts, plans, actions --
+    # to ~/SystemSupeUp/live so it can be watched from outside the app. Off by
+    # default because it writes continuously; on, it is the difference between
+    # debugging this tool by guessing and debugging it by reading.
+    "live_bridge": False,
 }
 
 
